@@ -654,3 +654,28 @@ def test_verify_signature_standalone():
 
 def test_verify_signature_invalid():
     assert not verify_signature({"any": "msg"}, {"r": "00" * 32, "s": "00" * 32, "pubkey": "02" + "00" * 32})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 17. AUDIT VERIFIER — VACUOUS TRUTH REGRESSION (LOOP-17)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_verify_trade_flow_empty_flow_is_not_quantum_safe(temp_audit_path):
+    """
+    A bogus/never-created order_id has no commitment, execution, or
+    settlement records at all, so AuditLog.get_trade_flow() returns all
+    three phases as None. Previously, verify_trade_flow() computed
+    chain_valid via all(v is True for v in [...] if v is not None), which
+    is vacuously True over an empty list — falsely marking a flow with
+    ZERO cryptographic evidence as quantum_safe=True. This must fail closed.
+    """
+    audit = AuditLog(temp_audit_path)
+    verifier = AuditVerifier()
+
+    result = verifier.verify_trade_flow("nonexistent-order-id", audit)
+
+    assert result["commitment_valid"] is None
+    assert result["execution_valid"] is None
+    assert result["settlement_valid"] is None
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False

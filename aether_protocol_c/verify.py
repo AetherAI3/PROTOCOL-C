@@ -165,13 +165,16 @@ class AuditVerifier:
             details.append("Settlement phase: MISSING")
 
         # ── Overall assessment ───────────────────────────────────────
-        chain_valid = all(
-            v is True
-            for v in [commitment_valid, execution_valid, settlement_valid]
-            if v is not None
+        phase_results = [commitment_valid, execution_valid, settlement_valid]
+        has_any_phase = any(v is not None for v in phase_results)
+        chain_valid = has_any_phase and all(
+            v is True for v in phase_results if v is not None
         )
 
         # Quantum safety summary
+        # A flow with zero recorded phases has no cryptographic evidence at
+        # all, so it must never be reported as quantum-safe (vacuous truth
+        # over an empty all() would otherwise make chain_valid=True here).
         quantum_safe = chain_valid  # If all checks pass, the flow is quantum-safe
 
         return {
