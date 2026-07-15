@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from .ephemeral_signer import EphemeralSigner
 
@@ -307,7 +310,21 @@ def verify_signature(message: dict, signature: dict) -> bool:
         result = temp.verify(message, signature)
         temp.destroy()
         return result
-    except Exception:
+    except (KeyError, ValueError, TypeError) as exc:
+        # Malformed signature envelope (missing field, bad hex, wrong
+        # length, etc.) -- no key material is logged.
+        logger.debug(
+            "verify_signature() failed to parse signature envelope: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.debug(
+            "verify_signature() failed with unexpected error: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return False
 
 

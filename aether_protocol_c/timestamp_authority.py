@@ -22,10 +22,15 @@ Usage::
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import ssl
 import time
+import urllib.error
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from pyasn1.type import univ, namedtype, tag, useful, constraint
@@ -145,14 +150,14 @@ if _PYASN1_AVAILABLE:
                     )
                 ),
             ),
-            namedtype.OptionalNamedType(
-                "crls",
-                univ.Any().subtype(
-                    implicitTag=tag.Tag(
-                        tag.tagClassContext, tag.tagFormatConstructed, 1
-                    )
-                ),
-            ),
+            # Note: CMS SignedData also permits an OPTIONAL [1] IMPLICIT
+            # `crls` field between `certificates` and `signerInfos`. It is
+            # intentionally not modeled here (pyasn1's schema-mode decoder
+            # cannot cleanly disambiguate two adjacent optional
+            # implicit-tagged ANY fields). RFC 3161 TSA responses do not
+            # populate this field in practice; a response that did would
+            # fail parsing here and verify() would conservatively return
+            # False (fail-closed), never a false positive.
             namedtype.NamedType("signerInfos", univ.SetOf(componentType=univ.Any())),
         )
 
@@ -235,6 +240,13 @@ class TimestampToken:
 
 class TimestampError(Exception):
     """Raised when timestamping operations fail."""
+
+
+# Genuine RFC 3161 TimeStampResp tokens are typically a few KB. Cap the
+# accepted response size generously above that to prevent a malicious or
+# compromised TSA endpoint (or a MITM) from streaming an unbounded body
+# and exhausting caller memory.
+MAX_TSA_RESPONSE_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 
 # ── RFC 3161 Timestamp Authority ──────────────────────────────────────
@@ -415,10 +427,53 @@ class RFC3161TimestampAuthority:
             method="POST",
         )
 
+        start = time.monotonic()
         try:
             with urllib.request.urlopen(http_req, timeout=self._timeout) as resp:
-                return resp.read()
+                content_length = resp.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        if int(content_length) > MAX_TSA_RESPONSE_BYTES:
+                            raise TimestampError(
+                                f"TSA response from {tsa_url} declares "
+                                f"Content-Length={content_length}, exceeding "
+                                f"the {MAX_TSA_RESPONSE_BYTES}-byte limit."
+                            )
+                    except ValueError:
+                        pass
+                body = resp.read(MAX_TSA_RESPONSE_BYTES + 1)
+                if len(body) > MAX_TSA_RESPONSE_BYTES:
+                    raise TimestampError(
+                        f"TSA response from {tsa_url} exceeded the "
+                        f"{MAX_TSA_RESPONSE_BYTES}-byte limit."
+                    )
+                return body
+        except ssl.SSLError as exc:
+            elapsed = time.monotonic() - start
+            logger.error(
+                "TSA TLS/certificate verification failed: host=%s exc_type=%s "
+                "elapsed=%.3fs detail=%s",
+                tsa_url, type(exc).__name__, elapsed, exc,
+            )
+            raise TimestampError(
+                f"TSA request to {tsa_url} failed: {exc}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            elapsed = time.monotonic() - start
+            logger.warning(
+                "TSA request failed: host=%s exc_type=%s elapsed=%.3fs detail=%s",
+                tsa_url, type(exc).__name__, elapsed, exc,
+            )
+            raise TimestampError(
+                f"TSA request to {tsa_url} failed: {exc}"
+            ) from exc
         except Exception as exc:
+            elapsed = time.monotonic() - start
+            logger.error(
+                "TSA request failed with unexpected error: host=%s exc_type=%s "
+                "elapsed=%.3fs detail=%s",
+                tsa_url, type(exc).__name__, elapsed, exc,
+            )
             raise TimestampError(
                 f"TSA request to {tsa_url} failed: {exc}"
             ) from exc
