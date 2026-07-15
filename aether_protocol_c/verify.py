@@ -165,11 +165,14 @@ class AuditVerifier:
             details.append("Settlement phase: MISSING")
 
         # ── Overall assessment ───────────────────────────────────────
+        # All three phases (commitment, execution, settlement) must be
+        # PRESENT and individually valid. A missing phase yields None for
+        # that phase's *_valid, which must never be silently filtered out
+        # of the aggregate check -- otherwise a flow missing e.g. the
+        # commitment record could still be certified chain_valid/quantum_safe
+        # as long as the phases that do exist are self-consistent.
         phase_results = [commitment_valid, execution_valid, settlement_valid]
-        has_any_phase = any(v is not None for v in phase_results)
-        chain_valid = has_any_phase and all(
-            v is True for v in phase_results if v is not None
-        )
+        chain_valid = all(v is True for v in phase_results)
 
         # Quantum safety summary
         # A flow with zero recorded phases has no cryptographic evidence at

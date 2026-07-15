@@ -679,3 +679,70 @@ def test_verify_trade_flow_empty_flow_is_not_quantum_safe(temp_audit_path):
     assert result["settlement_valid"] is None
     assert result["chain_valid"] is False
     assert result["quantum_safe"] is False
+
+
+def test_verify_trade_flow_missing_commitment_is_not_quantum_safe(temp_audit_path):
+    """
+    Round-2 finding: a flow with valid, self-consistent execution and
+    settlement records but NO commitment record at all (dropped, never
+    logged, or a race where commitment write fails silently) must not
+    be certified quantum_safe. Previously chain_valid was computed via
+    all(v is True for v in phase_results if v is not None), which drops
+    the None commitment_valid from the check entirely -- so a settlement
+    lacking any commitment-phase evidence could still be reported
+    chain_valid=True / quantum_safe=True. This must fail closed.
+    """
+    order_id = "missing_commit_001"
+    seed1 = get_seed()
+    seed2 = get_seed()
+    seed3 = get_seed()
+    snap = AccountSnapshot.from_dict(ACCOUNT_STATE)
+
+    # Commitment is created only to derive valid downstream references --
+    # it is deliberately NEVER appended to the audit log, simulating a
+    # dropped/pruned/never-written commitment record.
+    c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+        order_id=order_id,
+        trade_details=TRADE_DETAILS,
+        account_state=snap,
+        quantum_seed=seed1.seed_int,
+        measurement_method=seed1.method,
+    )
+
+    er = ExecutionResult(order_id=order_id, filled_qty=1, fill_price=50_000)
+    snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
+
+    att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        execution_result=er,
+        new_account_state=snap_after,
+        quantum_seed=seed2.seed_int,
+        measurement_method=seed2.method,
+    )
+
+    s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
+        order_id=order_id,
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        commitment_window=c_dict["key_temporal_window"],
+        execution_sig=att_sig,
+        execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
+        execution_window=att_dict["key_temporal_window"],
+        broker_sig="broker_ack_missing_commit",
+        quantum_seed=seed3.seed_int,
+        measurement_method=seed3.method,
+    )
+
+    audit = AuditLog(temp_audit_path)
+    audit.append_execution(att_dict, att_sig)
+    audit.append_settlement(s_dict, s_sig)
+
+    verifier = AuditVerifier()
+    result = verifier.verify_trade_flow(order_id, audit)
+
+    assert result["commitment_valid"] is None
+    assert result["execution_valid"] is True
+    assert result["settlement_valid"] is True
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False
