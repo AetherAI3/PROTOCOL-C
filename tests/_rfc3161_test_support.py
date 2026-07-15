@@ -86,6 +86,7 @@ def build_signed_timestamp_resp_der(
     *,
     tst_info_der=None,
     corrupt_signature: bool = False,
+    status: int = 0,
 ) -> bytes:
     """
     Build a full, decodable RFC 3161 ``TimeStampResp`` whose embedded
@@ -179,7 +180,7 @@ def build_signed_timestamp_resp_der(
     signed_data.setComponentByPosition(4, signer_infos)
     signed_data_der = der_encoder.encode(signed_data)
 
-    return _wrap_signed_data_in_resp(signed_data_der)
+    return _wrap_signed_data_in_resp(signed_data_der, status=status)
 
 
 def build_unsigned_timestamp_resp_der(digest: bytes) -> bytes:
@@ -216,7 +217,7 @@ def build_unsigned_timestamp_resp_der(digest: bytes) -> bytes:
     return _wrap_signed_data_in_resp(signed_data_der)
 
 
-def _wrap_signed_data_in_resp(signed_data_der: bytes) -> bytes:
+def _wrap_signed_data_in_resp(signed_data_der: bytes, status: int = 0) -> bytes:
     content_wrapped = univ.Any(signed_data_der).subtype(
         explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatConstructed, 0)
     )
@@ -225,7 +226,7 @@ def _wrap_signed_data_in_resp(signed_data_der: bytes) -> bytes:
     content_info.setComponentByPosition(1, content_wrapped)
 
     status_info = univ.Sequence()
-    status_info.setComponentByPosition(0, univ.Integer(0))  # granted
+    status_info.setComponentByPosition(0, univ.Integer(status))  # 0=granted, 1=grantedWithMods
 
     resp = univ.Sequence()
     resp.setComponentByPosition(0, status_info)
