@@ -16,81 +16,33 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 pyasn1 = pytest.importorskip("pyasn1")
+pytest.importorskip("pyasn1_modules")
+pytest.importorskip("cryptography")
 
-from pyasn1.codec.der import encoder as der_encoder
-from pyasn1.type import tag, univ, useful
+from tests._rfc3161_test_support import (
+    build_signed_timestamp_resp_der,
+    build_tst_info_der,
+    generate_self_signed_tsa_cert,
+)
 
 from aether_protocol_c.timestamp_authority import (
     RFC3161TimestampAuthority,
     TimestampError,
 )
 
-_SHA256_OID = univ.ObjectIdentifier((2, 16, 840, 1, 101, 3, 4, 2, 1))
-_TST_INFO_OID = univ.ObjectIdentifier((1, 2, 840, 113549, 1, 9, 16, 1, 4))
-_SIGNED_DATA_OID = univ.ObjectIdentifier((1, 2, 840, 113549, 1, 7, 2))
+_TSA_KEY, _TSA_CERT = generate_self_signed_tsa_cert()
 
 
-def _build_message_imprint(digest: bytes) -> univ.Sequence:
-    algo_seq = univ.Sequence()
-    algo_seq.setComponentByPosition(0, _SHA256_OID)
-    imprint = univ.Sequence()
-    imprint.setComponentByPosition(0, algo_seq)
-    imprint.setComponentByPosition(1, univ.OctetString(digest))
-    return imprint
-
-
-def _build_tst_info_der(digest: bytes, nonce: int | None) -> bytes:
-    """Build a DER-encoded TSTInfo, optionally echoing a nonce."""
-    from aether_protocol_c.timestamp_authority import TSTInfo
-
-    tst_info = TSTInfo()
-    tst_info.setComponentByName("version", univ.Integer(1))
-    tst_info.setComponentByName("policy", univ.ObjectIdentifier((1, 2, 3)))
-    tst_info.setComponentByName("messageImprint", _build_message_imprint(digest))
-    tst_info.setComponentByName("serialNumber", univ.Integer(1))
-    tst_info.setComponentByName(
-        "genTime", useful.GeneralizedTime("20260101000000Z")
+def _build_timestamp_resp_der(digest: bytes, nonce) -> bytes:
+    """Build a full, decodable, genuinely CMS-signed RFC 3161 TimeStampResp
+    whose embedded TSTInfo attests to ``digest`` and (optionally) echoes
+    ``nonce``. stamp() now runs the response through verify() (which
+    requires a valid CMS signature -- see F-7), so nonce-replay fixtures
+    must be genuinely signed too, not just hash/nonce-matching."""
+    tst_info_der = build_tst_info_der(digest, nonce=nonce)
+    return build_signed_timestamp_resp_der(
+        digest, _TSA_KEY, _TSA_CERT, tst_info_der=tst_info_der
     )
-    tst_info.setComponentByName("ordering", univ.Boolean(False))
-    if nonce is not None:
-        tst_info.setComponentByName("nonce", univ.Integer(nonce))
-    return der_encoder.encode(tst_info)
-
-
-def _build_timestamp_resp_der(digest: bytes, nonce: int | None) -> bytes:
-    """Build a full, decodable RFC 3161 TimeStampResp whose embedded
-    TSTInfo attests to ``digest`` and (optionally) echoes ``nonce``."""
-    tst_info_der = _build_tst_info_der(digest, nonce)
-
-    econtent = univ.OctetString(tst_info_der).subtype(
-        explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 0)
-    )
-    encap_content_info = univ.Sequence()
-    encap_content_info.setComponentByPosition(0, _TST_INFO_OID)
-    encap_content_info.setComponentByPosition(1, econtent)
-
-    signed_data = univ.Sequence()
-    signed_data.setComponentByPosition(0, univ.Integer(3))
-    signed_data.setComponentByPosition(1, univ.SetOf())
-    signed_data.setComponentByPosition(2, encap_content_info)
-    signed_data.setComponentByPosition(3, univ.SetOf())
-    signed_data_der = der_encoder.encode(signed_data)
-
-    content = univ.Any(signed_data_der).subtype(
-        explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatConstructed, 0)
-    )
-    content_info = univ.Sequence()
-    content_info.setComponentByPosition(0, _SIGNED_DATA_OID)
-    content_info.setComponentByPosition(1, content)
-
-    status_info = univ.Sequence()
-    status_info.setComponentByPosition(0, univ.Integer(0))  # granted
-
-    resp = univ.Sequence()
-    resp.setComponentByPosition(0, status_info)
-    resp.setComponentByPosition(1, content_info)
-
-    return der_encoder.encode(resp)
 
 
 def _make_mock_response(body: bytes):

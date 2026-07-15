@@ -41,7 +41,7 @@ except ImportError:
     _PYASN1_AVAILABLE = False
 
 try:
-    from pyasn1_modules import rfc3161, rfc5652
+    from pyasn1_modules import rfc5652
     from cryptography import x509
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
@@ -888,12 +888,17 @@ class RFC3161TimestampAuthority:
             if econtent is None or not econtent.hasValue():
                 return False
 
-            tst_info, _ = der_decoder.decode(bytes(econtent), asn1Spec=TSTInfo())
-            tsa_hashed_message = bytes(
-                tst_info.getComponentByName("messageImprint").getComponentByName(
-                    "hashedMessage"
-                )
-            )
+            # Schemaless decode -- see `_extract_tst_info_nonce`'s docstring:
+            # pyasn1's schema-mode TSTInfo() decoder cannot reliably
+            # disambiguate later optional/default fields (accuracy,
+            # ordering) from an included `nonce` when earlier optional
+            # fields are DER-omitted, and raises rather than risk a wrong
+            # parse. `messageImprint` is always the mandatory 3rd component
+            # (position 2), so it can be read positionally without
+            # depending on which trailing optional fields are present.
+            tst_info, _ = der_decoder.decode(bytes(econtent))
+            message_imprint = tst_info.getComponentByPosition(2)
+            tsa_hashed_message = bytes(message_imprint.getComponentByPosition(1))
         except Exception:
             # Malformed/unparsable TSA response -- cannot be trusted.
             return False
