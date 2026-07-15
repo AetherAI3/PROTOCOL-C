@@ -944,6 +944,94 @@ def test_verify_trade_flow_execution_symbol_side_substitution_rejected(
     )
 
 
+def test_verify_trade_flow_execution_symbol_side_omitted_from_commitment_rejected(
+    temp_audit_path,
+):
+    """
+    Round-8 finding (LOOP17-R8-01): trade_details is a free-form dict
+    supplied at commitment-creation time and neither
+    QuantumCommitmentVerifier.verify_state_binding nor
+    verify_quantum_binding require it to contain "symbol"/"side" -- only
+    "account_state_hash" and "nonce" are mandated. Before the fix,
+    verify_matches_commitment_terms only compared fill_symbol/fill_side
+    against the commitment when `authorised_symbol is not None or
+    authorised_side is not None`. If a commitment simply omitted
+    "symbol"/"side" from trade_details (e.g. only "qty"/"price" given),
+    that guard evaluated False and the symbol/side cross-check was
+    skipped entirely -- letting the execution report a completely
+    different instrument and/or the opposite side while qty/price still
+    matched, and every other check (signature, quantum binding, nonce,
+    chain linkage) still passed.
+
+    Arrange: build a commitment whose trade_details authorises only
+    qty=10 @ price=50 (no "symbol"/"side" keys at all), then an
+    execution attestation with matching qty/price but a concrete
+    symbol="TSLA"/side="SELL".
+    Act: run AuditVerifier.verify_trade_flow and the unit-level
+    verify_matches_commitment_terms check directly.
+    Assert: the unauthorised fill is rejected -- execution_valid=False,
+    chain_valid=False, quantum_safe=False -- instead of being silently
+    approved because symbol/side were never specified.
+    """
+    order_id = "symbol_side_omitted_from_commitment_001"
+    seed1 = get_seed()
+    seed2 = get_seed()
+    snap = AccountSnapshot.from_dict(ACCOUNT_STATE)
+
+    # trade_details deliberately omits "symbol" and "side" entirely.
+    authorised_trade = {"qty": 10, "price": 50}
+    c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+        order_id=order_id,
+        trade_details=authorised_trade,
+        account_state=snap,
+        quantum_seed=seed1.seed_int,
+        measurement_method=seed1.method,
+    )
+
+    # Qty and price exactly match the (incomplete) authorised terms, but
+    # the fill reports a concrete instrument/side that was never
+    # actually sanctioned by the commitment.
+    er = ExecutionResult(
+        order_id=order_id, symbol="TSLA", side="SELL", filled_qty=10, fill_price=50
+    )
+    snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
+
+    att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        execution_result=er,
+        new_account_state=snap_after,
+        quantum_seed=seed2.seed_int,
+        measurement_method=seed2.method,
+    )
+
+    audit = AuditLog(temp_audit_path)
+    audit.append_commitment(c_dict, c_sig)
+    audit.append_execution(att_dict, att_sig)
+
+    registry = AccountKeyRegistry()
+    registry.register(order_id, c_sig["pubkey"])
+    registry.register(order_id, att_sig["pubkey"])
+
+    verifier = AuditVerifier()
+    result = verifier.verify_trade_flow(order_id, audit, registry=registry)
+
+    assert result["commitment_valid"] is True
+    assert result["execution_valid"] is False
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False
+
+    # The unit-level check itself must also directly reject the
+    # unauthorised symbol/side rather than skipping the comparison
+    # because trade_details never specified them.
+    assert (
+        QuantumExecutionVerifier.verify_matches_commitment_terms(
+            authorised_trade, er.to_json()
+        )
+        is False
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 18. AUDIT VERIFIER — SELF-REFERENTIAL SIGNATURE / MISSING IDENTITY BINDING
 #     REGRESSION (LOOP-17 round 3)

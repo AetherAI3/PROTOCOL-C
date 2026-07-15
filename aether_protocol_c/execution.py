@@ -220,16 +220,22 @@ class QuantumExecutionVerifier:
 
         Args:
             trade_details: The commitment's authorised trade terms
-                (expects "qty" and "price" keys).
+                (expects "qty", "price", "symbol", and "side" keys).
+                "symbol"/"side" are mandatory here: a commitment that
+                omits them authorises nothing and must fail closed
+                rather than being treated as "any symbol/side allowed".
             execution_result: The execution's ``execution_result`` dict
-                (expects "filled_qty" and "fill_price" keys).
+                (expects "filled_qty", "fill_price", "symbol", and
+                "side" keys).
             price_tolerance: Maximum allowed fractional deviation of
                 fill_price from the authorised price (default 2%).
 
         Returns:
-            True if filled_qty does not exceed the authorised qty and
-            fill_price is within tolerance of the authorised price.
-            False if required fields are missing or terms diverge.
+            True if filled_qty does not exceed the authorised qty,
+            fill_price is within tolerance of the authorised price,
+            and fill_symbol/fill_side exactly match the authorised
+            symbol/side. False if required fields are missing (on
+            either side) or any term diverges.
         """
         if not isinstance(trade_details, dict) or not isinstance(execution_result, dict):
             return False
@@ -248,11 +254,19 @@ class QuantumExecutionVerifier:
         if filled_qty is None or fill_price is None:
             return False
 
-        if authorised_symbol is not None or authorised_side is not None:
-            if fill_symbol is None or fill_side is None:
-                return False
-            if fill_symbol != authorised_symbol or fill_side != authorised_side:
-                return False
+        # Symbol/side must always be authorised and must always match the
+        # fill. trade_details is a free-form dict supplied at commitment
+        # creation time and may simply omit "symbol"/"side" -- that must
+        # NOT be treated as "no constraint"; it must fail closed, since
+        # execution_result always carries a concrete symbol/side and an
+        # omitted authorisation is not evidence that any symbol/side was
+        # sanctioned.
+        if authorised_symbol is None or authorised_side is None:
+            return False
+        if fill_symbol is None or fill_side is None:
+            return False
+        if fill_symbol != authorised_symbol or fill_side != authorised_side:
+            return False
 
         try:
             authorised_qty = float(authorised_qty)
