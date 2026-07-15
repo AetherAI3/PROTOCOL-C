@@ -93,15 +93,40 @@ class AuditEntry:
 
     @staticmethod
     def from_dict(d: dict) -> "AuditEntry":
-        """Reconstruct from dict."""
-        return AuditEntry(
-            timestamp=d["timestamp"],
-            phase=d["phase"],
-            order_id=d["order_id"],
-            data=d["data"],
-            signature=d["signature"],
-            quantum_proof=d["quantum_proof"],
-        )
+        """Reconstruct from dict.
+
+        Raises:
+            AuditError: if required keys are missing or the `data`,
+                `signature`, or `quantum_proof` fields are not dicts.
+                This keeps malformed/tampered JSONL lines from silently
+                propagating non-dict values into downstream verification
+                code, which would otherwise crash with an unhandled
+                AttributeError instead of a clean tamper report.
+        """
+        try:
+            data = d["data"]
+            signature = d["signature"]
+            quantum_proof = d["quantum_proof"]
+            entry = AuditEntry(
+                timestamp=d["timestamp"],
+                phase=d["phase"],
+                order_id=d["order_id"],
+                data=data,
+                signature=signature,
+                quantum_proof=quantum_proof,
+            )
+        except KeyError as exc:
+            raise AuditError(f"Malformed audit entry: missing key {exc}") from exc
+
+        for field_name in ("data", "signature", "quantum_proof"):
+            value = getattr(entry, field_name)
+            if not isinstance(value, dict):
+                raise AuditError(
+                    f"Malformed audit entry: field '{field_name}' must be a "
+                    f"dict, got {type(value).__name__}"
+                )
+
+        return entry
 
 
 def _extract_quantum_proof(data: dict) -> dict:
@@ -274,9 +299,12 @@ class AuditLog:
                     entry = AuditEntry.from_dict(data)
                     self._index_entry(entry, offset, line_num)
                     line_num += 1
-                except (json.JSONDecodeError, KeyError):
-                    line_num += 1
-                    continue
+                except (json.JSONDecodeError, KeyError) as exc:
+                    self._conn.commit()
+                    raise AuditError(
+                        f"Corrupt audit log entry at line {line_num} "
+                        f"while rebuilding index: {exc}"
+                    ) from exc
         self._conn.commit()
 
     def _index_entry(

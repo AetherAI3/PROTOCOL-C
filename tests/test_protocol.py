@@ -163,6 +163,42 @@ def test_ephemeral_signer_deterministic():
     assert sig1["s"] == sig2["s"]
 
 
+def test_ephemeral_signer_zero_key_never_falls_back_to_known_constant(monkeypatch):
+    """
+    Regression test for F-5: when HMAC-derived key material reduces to 0 mod N,
+    the signer must NOT fall back to the hardcoded, publicly-known private key
+    of 1 (which would make pubkey == G and any signature trivially forgeable).
+    Instead it must re-derive deterministically via a domain-separated re-hash.
+    """
+    import aether_protocol_c.ephemeral_signer as signer_module
+
+    # Arrange: force the first HMAC digest to be all-zero bytes (== 0 mod N),
+    # then let subsequent (domain-separated retry) calls behave normally.
+    real_hmac_new = signer_module.hmac.new
+    call_count = {"n": 0}
+
+    class ZeroThenRealHmac:
+        def __init__(self, key, msg, digestmod):
+            call_count["n"] += 1
+            self._first_call = call_count["n"] == 1
+            self._real = real_hmac_new(key, msg, digestmod)
+
+        def digest(self):
+            if self._first_call:
+                return b"\x00" * 32
+            return self._real.digest()
+
+    monkeypatch.setattr(signer_module.hmac, "new", ZeroThenRealHmac)
+
+    # Act
+    signer = EphemeralSigner(quantum_seed=42)
+
+    # Assert: private key must never be the known-degenerate constant 1,
+    # and must never be 0 either.
+    assert signer._privkey != 1
+    assert signer._privkey != 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. QUANTUM SEED COMMITMENT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -545,6 +581,52 @@ def test_audit_log_query(temp_audit_path):
 
     results = audit.query(record_type=PHASE_COMMITMENT)
     assert len(results) >= 1
+
+
+def test_audit_entry_from_dict_rejects_non_dict_data():
+    # Arrange: a syntactically valid JSONL line where `data` is a string
+    # instead of a dict (e.g. a tampered/corrupted record).
+    malformed = {
+        "timestamp": 1,
+        "phase": PHASE_COMMITMENT,
+        "order_id": "tampered_001",
+        "data": "not-a-dict",
+        "signature": {"alg": "ed25519"},
+        "quantum_proof": {"seed_commitment": "abc"},
+    }
+
+    # Act / Assert: from_dict must reject it with AuditError, not let a
+    # bad-typed field silently flow downstream into verification code.
+    from aether_protocol_c.audit import AuditError
+
+    with pytest.raises(AuditError, match="data"):
+        AuditEntry.from_dict(malformed)
+
+
+def test_audit_log_read_all_raises_audit_error_on_malformed_data_field(temp_audit_path):
+    # Arrange: write a JSONL line directly with a non-dict `signature` field,
+    # simulating a corrupted/tampered audit log entry on disk.
+    malformed_line = {
+        "timestamp": 1,
+        "phase": PHASE_COMMITMENT,
+        "order_id": "tampered_002",
+        "data": {"quantum_seed_commitment": "abc"},
+        "signature": ["unexpected", "list", "not", "dict"],
+        "quantum_proof": {"seed_commitment": "abc"},
+    }
+    with open(temp_audit_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(malformed_line) + "\n")
+
+    # Act / Assert: opening the log rebuilds the SQLite index by scanning
+    # the JSONL file and calling AuditEntry.from_dict() on each line; a
+    # malformed record must raise a clean AuditError (from from_dict's
+    # type validation) instead of letting the bad-typed field propagate
+    # silently or crash later with a raw AttributeError in verification
+    # code.
+    from aether_protocol_c.audit import AuditError
+
+    with pytest.raises(AuditError):
+        AuditLog(temp_audit_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
