@@ -266,12 +266,10 @@ class QuantumEphemeralKey:
         Returns:
             True if the signature is valid.
         """
-        # EphemeralSigner.verify uses the pubkey from the signature envelope,
-        # not the private key, so we can use a temporary signer for verification.
-        temp = EphemeralSigner(quantum_seed=1)  # seed irrelevant for verify
-        result = temp.verify(message, signature)
-        temp.destroy()
-        return result
+        # Delegates to the module-level verify_signature() (which itself
+        # delegates to EphemeralSigner.verify_static()) so there is a single
+        # implementation of signature verification in this package.
+        return verify_signature(message, signature)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -306,10 +304,10 @@ def verify_signature(message: dict, signature: dict) -> bool:
         True if the signature is valid.
     """
     try:
-        temp = EphemeralSigner(quantum_seed=1)
-        result = temp.verify(message, signature)
-        temp.destroy()
-        return result
+        # verify_static() only parses the pubkey embedded in the signature
+        # envelope -- no private key is derived, unlike constructing a
+        # throwaway EphemeralSigner just to call its instance verify().
+        return EphemeralSigner.verify_static(message, signature)
     except (KeyError, ValueError, TypeError) as exc:
         # Malformed signature envelope (missing field, bad hex, wrong
         # length, etc.) -- no key material is logged.
