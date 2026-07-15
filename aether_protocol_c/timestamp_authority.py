@@ -40,6 +40,24 @@ try:
 except ImportError:
     _PYASN1_AVAILABLE = False
 
+try:
+    from pyasn1_modules import rfc3161, rfc5652
+    from cryptography import x509
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+    _CMS_VERIFY_AVAILABLE = True
+except ImportError:
+    _CMS_VERIFY_AVAILABLE = False
+
+# OIDs for digest algorithms that may appear in a TSA's CMS SignerInfo.
+_DIGEST_OID_TO_HASH_ALGO = {
+    "1.3.14.3.2.26": "sha1",
+    "2.16.840.1.101.3.4.2.1": "sha256",
+    "2.16.840.1.101.3.4.2.2": "sha384",
+    "2.16.840.1.101.3.4.2.3": "sha512",
+}
+
 
 # ── ASN.1 structures for RFC 3161 ────────────────────────────────────
 
@@ -404,15 +422,31 @@ class RFC3161TimestampAuthority:
 
         return der_encoder.encode(req), nonce_val
 
-    def _extract_tst_info(self, resp_bytes: bytes) -> "TSTInfo":
+    def _extract_tst_info_nonce(self, resp_bytes: bytes) -> Optional[int]:
         """
-        Parse a raw ``TimeStampResp`` and return the embedded ``TSTInfo``.
+        Parse a raw ``TimeStampResp`` and return the ``TSTInfo.nonce``
+        value, if present.
+
+        The embedded ``TSTInfo`` is decoded *schemaless* (without
+        ``asn1Spec=TSTInfo()``) deliberately: ``TSTInfo``'s optional
+        ``accuracy`` field is modelled as ``univ.Any()`` (see the class
+        docstring), and pyasn1's schema-mode decoder cannot determine
+        whether a following untagged optional/default field (``accuracy``,
+        ``ordering``) is present when trailing bytes exist -- it raises
+        rather than silently mis-parsing. A schemaless decode sidesteps
+        this because each universally-tagged primitive (``INTEGER``,
+        ``BOOLEAN``, ``SEQUENCE``, ...) is resolved directly from its own
+        DER tag, with no ambiguity to resolve. ``nonce`` is the only
+        top-level ``INTEGER``-tagged field in ``TSTInfo`` after
+        ``serialNumber``/``genTime``, so it can be found unambiguously by
+        tag once the mandatory prefix is skipped.
 
         Args:
             resp_bytes: Raw DER-encoded TimeStampResp bytes.
 
         Returns:
-            The decoded ``TSTInfo`` ASN.1 structure.
+            The nonce value echoed by the TSA, or ``None`` if the
+            TSTInfo has no nonce field.
 
         Raises:
             TimestampError: If the response cannot be parsed, does not
@@ -444,7 +478,17 @@ class RFC3161TimestampAuthority:
             if econtent is None or not econtent.hasValue():
                 raise TimestampError("TSA response is missing eContent")
 
-            tst_info, _ = der_decoder.decode(bytes(econtent), asn1Spec=TSTInfo())
+            # Schemaless decode -- see docstring above.
+            tst_info, _ = der_decoder.decode(bytes(econtent))
+
+            # Mandatory prefix: version, policy, messageImprint,
+            # serialNumber, genTime -- always exactly 5 components.
+            nonce_val: Optional[int] = None
+            for i in range(5, len(tst_info)):
+                component = tst_info.getComponentByPosition(i)
+                if isinstance(component, univ.Integer):
+                    nonce_val = int(component)
+                    break
         except TimestampError:
             raise
         except Exception as exc:
@@ -452,7 +496,158 @@ class RFC3161TimestampAuthority:
                 f"Failed to parse TSA response: {exc}"
             ) from exc
 
-        return tst_info
+        return nonce_val
+
+    def _verify_cms_signature(self, content_info_content: bytes) -> bool:
+        """
+        Verify the CMS ``SignedData`` signature covering a TSA's
+        ``TimeStampToken``, proving the response was produced by whoever
+        holds the private key for the embedded signer certificate --
+        rather than trusting any bytes an HTTP endpoint chooses to return.
+
+        Args:
+            content_info_content: The DER bytes of the ``SignedData``
+                (i.e. ``ContentInfo.content``) extracted from the TSA's
+                ``TimeStampResp``.
+
+        Returns:
+            ``True`` if a signerInfo's signature verifies against the
+            embedded signer certificate's public key; ``False`` on any
+            parsing failure, missing signer/certificate, digest mismatch,
+            or signature mismatch (fail-closed).
+        """
+        if not _CMS_VERIFY_AVAILABLE:
+            return False
+
+        try:
+            signed_data, _ = der_decoder.decode(
+                content_info_content, asn1Spec=rfc5652.SignedData()
+            )
+
+            econtent = bytes(
+                signed_data["encapContentInfo"]["eContent"]
+            )
+
+            signer_infos = signed_data["signerInfos"]
+            if len(signer_infos) < 1:
+                return False
+
+            # Collect embedded certificates (CertificateChoices -> Certificate).
+            certs = []
+            if signed_data["certificates"].isValue:
+                for choice in signed_data["certificates"]:
+                    if choice.getName() == "certificate":
+                        cert_der = der_encoder.encode(choice["certificate"])
+                        certs.append(x509.load_der_x509_certificate(cert_der))
+
+            for signer_info in signer_infos:
+                if self._verify_single_signer(signer_info, econtent, certs):
+                    return True
+
+            return False
+        except Exception:
+            # Any parsing/verification failure means the signature cannot
+            # be trusted -- fail closed.
+            return False
+
+    def _verify_single_signer(
+        self, signer_info, econtent: bytes, certs: list
+    ) -> bool:
+        """
+        Verify one CMS ``SignerInfo`` against a candidate signer
+        certificate's public key.
+
+        Args:
+            signer_info: A parsed ``rfc5652.SignerInfo``.
+            econtent: The raw ``eContent`` (DER-encoded ``TSTInfo``) bytes.
+            certs: Candidate signer certificates from ``SignedData``.
+
+        Returns:
+            ``True`` if the signature verifies; ``False`` otherwise.
+        """
+        if not certs:
+            return False
+
+        # Select the certificate identified by issuerAndSerialNumber when
+        # present; otherwise fall back to the sole/first embedded cert.
+        signer_cert = certs[0]
+        sid = signer_info["sid"]
+        if sid.getName() == "issuerAndSerialNumber":
+            iasn = sid["issuerAndSerialNumber"]
+            serial = int(iasn["serialNumber"])
+            issuer_der = der_encoder.encode(iasn["issuer"])
+            for cert in certs:
+                if (
+                    cert.serial_number == serial
+                    and cert.issuer.public_bytes() == issuer_der
+                ):
+                    signer_cert = cert
+                    break
+            else:
+                return False
+
+        digest_oid = str(signer_info["digestAlgorithm"]["algorithm"])
+        hash_name = _DIGEST_OID_TO_HASH_ALGO.get(digest_oid)
+        if hash_name is None:
+            return False
+        hash_cls = {
+            "sha1": hashes.SHA1,
+            "sha256": hashes.SHA256,
+            "sha384": hashes.SHA384,
+            "sha512": hashes.SHA512,
+        }[hash_name]
+
+        signed_attrs = signer_info["signedAttrs"]
+        if signed_attrs.isValue:
+            # signedAttrs must contain a messageDigest attribute equal to
+            # the digest of eContent -- otherwise the signature could
+            # cover attributes disconnected from the actual TSTInfo.
+            message_digest = None
+            for attr in signed_attrs:
+                if str(attr["attrType"]) == str(rfc5652.id_messageDigest):
+                    values = attr["attrValues"]
+                    if len(values) != 1:
+                        return False
+                    inner, _ = der_decoder.decode(bytes(values[0]))
+                    message_digest = bytes(inner)
+                    break
+            if message_digest is None:
+                return False
+
+            digest = hashlib.new(hash_name, econtent).digest()
+            if message_digest != digest:
+                return False
+
+            # Re-tag signedAttrs from its IMPLICIT [0] context tag to the
+            # universal SET tag it must have for signature purposes
+            # (RFC 5652 §5.4): the signature covers a DER SET OF Attribute,
+            # not the [0]-tagged field as it appears in SignerInfo.
+            reencoded_attrs = signed_attrs.clone(
+                tagSet=rfc5652.SignedAttributes().tagSet,
+                cloneValueFlag=True,
+            )
+            signed_bytes = der_encoder.encode(reencoded_attrs)
+        else:
+            signed_bytes = econtent
+
+        signature = bytes(signer_info["signature"])
+        public_key = signer_cert.public_key()
+
+        try:
+            if isinstance(public_key, rsa.RSAPublicKey):
+                public_key.verify(
+                    signature, signed_bytes, padding.PKCS1v15(), hash_cls()
+                )
+            elif isinstance(public_key, ec.EllipticCurvePublicKey):
+                public_key.verify(
+                    signature, signed_bytes, ec.ECDSA(hash_cls())
+                )
+            else:
+                return False
+        except InvalidSignature:
+            return False
+
+        return True
 
     def _send_request(self, tsa_url: str, req_bytes: bytes) -> bytes:
         """
@@ -568,21 +763,20 @@ class RFC3161TimestampAuthority:
                 # distinguished from a fresh response, letting a malicious
                 # or compromised TSA / on-path attacker misattribute a
                 # stale time to new data.
-                tst_info = self._extract_tst_info(resp_bytes)
-                resp_nonce = tst_info.getComponentByName("nonce")
-                if resp_nonce is None or not resp_nonce.hasValue():
+                resp_nonce = self._extract_tst_info_nonce(resp_bytes)
+                if resp_nonce is None:
                     raise TimestampError(
                         f"TSA response from {url} did not echo the "
                         "request nonce; rejecting to prevent replay."
                     )
-                if int(resp_nonce) != nonce_val:
+                if resp_nonce != nonce_val:
                     raise TimestampError(
                         f"TSA response from {url} echoed nonce "
-                        f"{int(resp_nonce)}, expected {nonce_val}; "
+                        f"{resp_nonce}, expected {nonce_val}; "
                         "possible replay of a stale/substituted response."
                     )
 
-                return TimestampToken(
+                candidate = TimestampToken(
                     tsa_url=url,
                     token_bytes=resp_bytes,
                     token_hex=resp_bytes.hex(),
@@ -590,6 +784,19 @@ class RFC3161TimestampAuthority:
                     hash_algorithm="sha-256",
                     message_imprint=digest_hex,
                 )
+
+                # Reject the response outright unless it also passes full
+                # verification (status/hash/CMS signature) -- otherwise
+                # stamp() would happily persist a token that verify()
+                # itself would later reject.
+                if not self.verify(data, candidate):
+                    raise TimestampError(
+                        f"TSA response from {url} failed verification "
+                        "(bad status, hash mismatch, or invalid CMS "
+                        "signature); rejecting."
+                    )
+
+                return candidate
             except TimestampError as exc:
                 errors.append(str(exc))
                 continue
@@ -615,15 +822,22 @@ class RFC3161TimestampAuthority:
            TSTInfo* -- i.e. the hash the TSA itself attested to -- and
            requires it to equal ``sha256(data)``.
 
+        4. Verifies the CMS ``SignerInfo`` signature over that ``TSTInfo``
+           against the signer certificate embedded in the response,
+           proving the response was produced by whoever holds the
+           corresponding private key (``_verify_cms_signature``).
+
         This defeats a malicious/compromised TSA (or network attacker)
         returning arbitrary ``token_bytes`` alongside a self-computed
-        ``message_imprint``: without a genuine TSA response whose embedded
-        TSTInfo hash matches the data, verification now fails.
+        ``message_imprint``: without a genuine, correctly-signed TSA
+        response whose embedded TSTInfo hash matches the data, verification
+        now fails.
 
-        Note: this does **not** verify the CMS ``SignerInfo`` signature or
-        the TSA certificate chain -- it only cryptographically parses and
-        checks the content the signature covers.  For full trust-chain
-        verification, pair this with a dedicated PKI/CMS library.
+        Note: this verifies the CMS signature against the certificate
+        embedded in the response itself; it does **not** build/validate a
+        full certificate chain to a trusted root store. Pair this with a
+        dedicated PKI library (or pin the expected TSA certificate) if a
+        full chain-of-trust guarantee is required.
 
         Args:
             data: The original data that was timestamped.
@@ -631,8 +845,9 @@ class RFC3161TimestampAuthority:
 
         Returns:
             ``True`` if the TSA's own signed TSTInfo hash matches
-            ``sha256(data)``; ``False`` otherwise (including on any
-            malformed/unparsable response).
+            ``sha256(data)`` *and* the CMS signature over that TSTInfo
+            verifies against the embedded signer certificate; ``False``
+            otherwise (including on any malformed/unparsable response).
 
         Raises:
             TimestampError: If pyasn1 is not available.
@@ -641,6 +856,12 @@ class RFC3161TimestampAuthority:
             raise TimestampError(
                 "pyasn1 is required to verify RFC 3161 timestamps.  "
                 "Install with:  pip install pyasn1"
+            )
+        if not _CMS_VERIFY_AVAILABLE:
+            raise TimestampError(
+                "pyasn1_modules and cryptography are required to verify "
+                "RFC 3161 timestamp signatures.  Install with:  "
+                "pip install pyasn1_modules cryptography"
             )
 
         expected_digest = hashlib.sha256(data).digest()
@@ -681,4 +902,11 @@ class RFC3161TimestampAuthority:
             return False
 
         # Sanity-check the locally recorded imprint is consistent too.
-        return token.message_imprint == expected_digest.hex()
+        if token.message_imprint != expected_digest.hex():
+            return False
+
+        # Finally, verify the CMS signature covering that TSTInfo against
+        # the embedded signer certificate. Without this, an attacker could
+        # forge a well-formed but unsigned/self-authored TimeStampResp with
+        # the correct hash and status, and it would pass every check above.
+        return self._verify_cms_signature(signed_data_der)
