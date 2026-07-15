@@ -191,6 +191,71 @@ class QuantumExecutionVerifier:
         return attestation.get("commitment_sig") == commitment_sig
 
     @staticmethod
+    def verify_matches_commitment_terms(
+        trade_details: dict,
+        execution_result: dict,
+        price_tolerance: float = 0.02,
+    ) -> bool:
+        """
+        Verify the execution's actual fill terms correspond to what the
+        commitment authorised.
+
+        A valid ``commitment_sig`` reference (dict-equality of the
+        signature envelope, see ``verify_references_commitment``) only
+        proves the execution phase points at the right commitment
+        record -- it says nothing about whether the economic terms that
+        were actually filled (quantity, price) stay within what
+        ``trade_details`` authorised. Without this check, a validly
+        signed execution attestation could report an arbitrarily larger
+        filled_qty and/or wildly different fill_price than what was
+        committed to, and every other check (signature, quantum
+        binding, nonce, seed independence, chain linkage) would still
+        pass.
+
+        Args:
+            trade_details: The commitment's authorised trade terms
+                (expects "qty" and "price" keys).
+            execution_result: The execution's ``execution_result`` dict
+                (expects "filled_qty" and "fill_price" keys).
+            price_tolerance: Maximum allowed fractional deviation of
+                fill_price from the authorised price (default 2%).
+
+        Returns:
+            True if filled_qty does not exceed the authorised qty and
+            fill_price is within tolerance of the authorised price.
+            False if required fields are missing or terms diverge.
+        """
+        if not isinstance(trade_details, dict) or not isinstance(execution_result, dict):
+            return False
+
+        authorised_qty = trade_details.get("qty")
+        authorised_price = trade_details.get("price")
+        filled_qty = execution_result.get("filled_qty")
+        fill_price = execution_result.get("fill_price")
+
+        if authorised_qty is None or authorised_price is None:
+            return False
+        if filled_qty is None or fill_price is None:
+            return False
+
+        try:
+            authorised_qty = float(authorised_qty)
+            authorised_price = float(authorised_price)
+            filled_qty = float(filled_qty)
+            fill_price = float(fill_price)
+        except (TypeError, ValueError):
+            return False
+
+        if filled_qty < 0 or filled_qty > authorised_qty:
+            return False
+
+        if authorised_price == 0:
+            return fill_price == 0
+
+        deviation = abs(fill_price - authorised_price) / abs(authorised_price)
+        return deviation <= price_tolerance
+
+    @staticmethod
     def verify_nonce_increment(commitment_nonce: int, attestation: dict) -> bool:
         """Verify that nonce_after == commitment_nonce + 1."""
         return attestation.get("nonce_after") == commitment_nonce + 1

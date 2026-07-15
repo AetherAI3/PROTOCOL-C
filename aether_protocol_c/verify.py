@@ -174,6 +174,19 @@ class AuditVerifier:
                 details.append(f"Seeds independent (commitment vs execution): {seeds_independent}")
                 if not seeds_independent:
                     execution_valid = False
+
+            # Check the executed fill terms actually match what was
+            # authorised in the commitment (qty/price bounds) -- chain
+            # linkage alone does not prove economic-term correspondence.
+            if flow["commitment"] is not None:
+                trade_details = flow["commitment"].get("trade_details", {})
+                execution_result = flow["execution"].get("execution_result", {})
+                terms_ok = QuantumExecutionVerifier.verify_matches_commitment_terms(
+                    trade_details, execution_result
+                )
+                details.append(f"Execution matches authorised trade terms: {terms_ok}")
+                if not terms_ok:
+                    execution_valid = False
         else:
             details.append("Execution phase: MISSING")
 
@@ -339,6 +352,15 @@ class AuditVerifier:
                 if not QuantumExecutionVerifier.verify_independent_seeds(c_seed, e_seed):
                     issues.append(
                         "SEED_REUSE: Commitment and execution used the same quantum seed"
+                    )
+                trade_details = flow["commitment"].get("trade_details", {})
+                execution_result = flow["execution"].get("execution_result", {})
+                if not QuantumExecutionVerifier.verify_matches_commitment_terms(
+                    trade_details, execution_result
+                ):
+                    issues.append(
+                        "EXECUTION_TERMS_MISMATCH: Filled qty/price does not match "
+                        "the authorised commitment's trade_details"
                     )
             _check_identity(flow["execution_sig"], "EXECUTION")
 
