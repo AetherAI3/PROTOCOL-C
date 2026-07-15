@@ -1194,6 +1194,57 @@ def test_attacker_key_rejected_by_registry_legit_key_accepted(temp_audit_path):
     assert forged_tamper["tampered"] is True
 
 
+def test_detect_tampering_flags_unauthorized_commitment_execution_settlement_keys_in_isolation(
+    temp_audit_path,
+):
+    """
+    Mutation-testing gap fix (LOOP-12): ``detect_tampering``'s per-phase
+    ``_check_identity`` closure (used for COMMITMENT/EXECUTION/SETTLEMENT)
+    must independently flag an unauthorized signing key, not merely
+    "some issue got added somewhere". The existing forged-flow regression
+    test above registers no keys at all for the forged order, so its
+    broker-ack check (a separate, un-mutated code path at
+    ``BROKER_UNAUTHORIZED_KEY``) also fires and can mask a broken
+    COMMITMENT/EXECUTION/SETTLEMENT identity check -- a mutant that
+    inverted ``if not registry.is_authorized(...)`` to
+    ``if registry.is_authorized(...)`` in ``_check_identity`` silently
+    passed the full suite because that other issue still showed up.
+
+    This test isolates the phase-level checks: the broker key IS
+    registered (so BROKER_UNAUTHORIZED_KEY never fires), but the
+    commitment/execution/settlement signing key is deliberately left
+    unregistered for this order, so the only possible source of an
+    UNAUTHORIZED_KEY issue is the phase-level ``_check_identity`` call.
+    """
+    order_id = "isolated_unauthorized_phase_key"
+    c_dict, c_sig, att_dict, att_sig, s_dict, s_sig, broker_pubkey = _build_full_flow(order_id)
+
+    registry = AccountKeyRegistry()
+    # Only the broker key is registered -- commitment/execution/settlement
+    # signing keys are intentionally left unauthorized for this scope.
+    registry.register(f"broker:{order_id}", broker_pubkey)
+
+    audit = AuditLog(str(temp_audit_path) + ".isolated")
+    audit.append_commitment(c_dict, c_sig)
+    audit.append_execution(att_dict, att_sig)
+    audit.append_settlement(s_dict, s_sig)
+
+    verifier = AuditVerifier()
+    tamper = verifier.detect_tampering(order_id, audit, registry=registry)
+
+    assert any(
+        issue.startswith("COMMITMENT_UNAUTHORIZED_KEY") for issue in tamper["issues"]
+    )
+    assert any(
+        issue.startswith("EXECUTION_UNAUTHORIZED_KEY") for issue in tamper["issues"]
+    )
+    assert any(
+        issue.startswith("SETTLEMENT_UNAUTHORIZED_KEY") for issue in tamper["issues"]
+    )
+    assert not any(issue.startswith("BROKER_UNAUTHORIZED_KEY") for issue in tamper["issues"])
+    assert tamper["tampered"] is True
+
+
 def test_account_key_registry_rejects_malformed_pubkey():
     registry = AccountKeyRegistry()
     with pytest.raises(IdentityError):
