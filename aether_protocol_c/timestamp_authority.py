@@ -356,7 +356,7 @@ class RFC3161TimestampAuthority:
 
         return url
 
-    def _build_timestamp_request(self, data: bytes) -> bytes:
+    def _build_timestamp_request(self, data: bytes) -> tuple[bytes, int]:
         """
         Build a DER-encoded RFC 3161 TimeStampReq for the given data.
 
@@ -364,7 +364,10 @@ class RFC3161TimestampAuthority:
             data: The raw bytes to timestamp.
 
         Returns:
-            DER-encoded TimeStampReq bytes.
+            A tuple of ``(der_encoded_request_bytes, nonce_value)``. The
+            caller must retain ``nonce_value`` so the corresponding
+            ``TimeStampResp`` can be checked for nonce-echo, defeating
+            replay of a stale/substituted response (RFC 3161 §2.4.2).
 
         Raises:
             TimestampError: If pyasn1 is not available.
@@ -399,7 +402,57 @@ class RFC3161TimestampAuthority:
         )
         req.setComponentByName("certReq", cert_req)
 
-        return der_encoder.encode(req)
+        return der_encoder.encode(req), nonce_val
+
+    def _extract_tst_info(self, resp_bytes: bytes) -> "TSTInfo":
+        """
+        Parse a raw ``TimeStampResp`` and return the embedded ``TSTInfo``.
+
+        Args:
+            resp_bytes: Raw DER-encoded TimeStampResp bytes.
+
+        Returns:
+            The decoded ``TSTInfo`` ASN.1 structure.
+
+        Raises:
+            TimestampError: If the response cannot be parsed, does not
+                report a granted status, or is missing the timestamp token.
+        """
+        try:
+            resp, _ = der_decoder.decode(resp_bytes, asn1Spec=TimeStampResp())
+
+            status = int(
+                resp.getComponentByName("status").getComponentByName("status")
+            )
+            if status not in (0, 1):  # 0=granted, 1=grantedWithMods
+                raise TimestampError(
+                    f"TSA reported non-granted status: {status}"
+                )
+
+            content_info = resp.getComponentByName("timeStampToken")
+            if content_info is None or not content_info.hasValue():
+                raise TimestampError("TSA response is missing timeStampToken")
+
+            signed_data_der = bytes(content_info.getComponentByName("content"))
+            signed_data, _ = der_decoder.decode(
+                signed_data_der, asn1Spec=SignedData()
+            )
+
+            econtent = signed_data.getComponentByName(
+                "encapContentInfo"
+            ).getComponentByName("eContent")
+            if econtent is None or not econtent.hasValue():
+                raise TimestampError("TSA response is missing eContent")
+
+            tst_info, _ = der_decoder.decode(bytes(econtent), asn1Spec=TSTInfo())
+        except TimestampError:
+            raise
+        except Exception as exc:
+            raise TimestampError(
+                f"Failed to parse TSA response: {exc}"
+            ) from exc
+
+        return tst_info
 
     def _send_request(self, tsa_url: str, req_bytes: bytes) -> bytes:
         """
@@ -495,13 +548,40 @@ class RFC3161TimestampAuthority:
             TimestampError: If both TSAs are unavailable or pyasn1
                 is missing.
         """
-        req_bytes = self._build_timestamp_request(data)
+        if not _PYASN1_AVAILABLE:
+            raise TimestampError(
+                "pyasn1 is required for RFC 3161 timestamps.  "
+                "Install with:  pip install pyasn1"
+            )
+
+        req_bytes, nonce_val = self._build_timestamp_request(data)
         digest_hex = hashlib.sha256(data).hexdigest()
 
         errors: list[str] = []
         for url in (self._tsa_url, self._fallback_url):
             try:
                 resp_bytes = self._send_request(url, req_bytes)
+
+                # Parse TSTInfo.nonce and require it to match the nonce we
+                # sent. Without this check, a captured/replayed prior
+                # TimeStampResp (for potentially different data) cannot be
+                # distinguished from a fresh response, letting a malicious
+                # or compromised TSA / on-path attacker misattribute a
+                # stale time to new data.
+                tst_info = self._extract_tst_info(resp_bytes)
+                resp_nonce = tst_info.getComponentByName("nonce")
+                if resp_nonce is None or not resp_nonce.hasValue():
+                    raise TimestampError(
+                        f"TSA response from {url} did not echo the "
+                        "request nonce; rejecting to prevent replay."
+                    )
+                if int(resp_nonce) != nonce_val:
+                    raise TimestampError(
+                        f"TSA response from {url} echoed nonce "
+                        f"{int(resp_nonce)}, expected {nonce_val}; "
+                        "possible replay of a stale/substituted response."
+                    )
+
                 return TimestampToken(
                     tsa_url=url,
                     token_bytes=resp_bytes,
