@@ -29,32 +29,76 @@ from .crypto import (
     make_temporal_window,
 )
 
+__all__ = [
+    "SettlementError",
+    "compute_flow_merkle",
+    "build_broker_attestation",
+    "QuantumSettlementRecord",
+    "QuantumSettlementVerifier",
+]
+
 
 class SettlementError(Exception):
     """Raised when settlement operations fail."""
 
 
 def compute_flow_merkle(
-    commitment_sig: dict, execution_sig: dict, broker_sig: str
+    commitment_sig: dict,
+    execution_sig: dict,
+    broker_sig: str,
+    broker_signature: Optional[dict] = None,
 ) -> str:
     """
-    Compute the flow merkle hash from three signature components.
+    Compute the flow merkle hash from the signature components.
 
     This is a SHA-256 of the canonical concatenation of commitment
-    signature, execution signature, and broker settlement acknowledgement.
+    signature, execution signature, broker settlement acknowledgement
+    text, and the broker's own cryptographic signature envelope over
+    that acknowledgement (see ``broker_signature`` on
+    ``QuantumSettlementRecord`` / ``build_broker_attestation``).
+    Folding ``broker_signature`` into the merkle means any tampering
+    with the broker's attestation (including stripping it, or swapping
+    it for a different broker's envelope) invalidates the merkle hash.
 
     Args:
         commitment_sig: Commitment signature envelope.
         execution_sig: Execution signature envelope.
         broker_sig: Broker's settlement acknowledgement string.
+        broker_signature: The broker's own ECDSA signature envelope
+            (as produced by their ``QuantumEphemeralKey``/signer) over
+            the broker attestation payload -- proves a specific,
+            identifiable broker key actually produced ``broker_sig``,
+            rather than it being an arbitrary unauthenticated string.
 
     Returns:
         Hex-encoded SHA-256 merkle hash.
     """
     commitment_str = json.dumps(commitment_sig, sort_keys=True, separators=(",", ":"))
     execution_str = json.dumps(execution_sig, sort_keys=True, separators=(",", ":"))
-    combined = commitment_str + execution_str + broker_sig
+    broker_signature_str = json.dumps(
+        broker_signature or {}, sort_keys=True, separators=(",", ":")
+    )
+    combined = commitment_str + execution_str + broker_sig + broker_signature_str
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+
+def build_broker_attestation(
+    order_id: str, commitment_sig: dict, execution_sig: dict, broker_sig: str
+) -> dict:
+    """
+    Canonical payload the broker's key must sign to authenticate an
+    acknowledgement string.
+
+    Binding order_id + commitment_sig + execution_sig into the signed
+    payload (not just the free-form ack text) prevents a broker's
+    signature over one settlement from being replayed onto another.
+    """
+    return {
+        "order_id": order_id,
+        "broker_ack": broker_sig,
+        "commitment_sig": commitment_sig,
+        "execution_sig": execution_sig,
+    }
 
 
 @dataclass(frozen=True)
@@ -88,6 +132,7 @@ class QuantumSettlementRecord:
     execution_quantum_seed_commitment: str
     execution_temporal_window: dict
     broker_settlement_sig: str
+    broker_signature: dict
     settlement_timestamp: int
     settlement_quantum_seed_commitment: str
     settlement_temporal_window: dict
@@ -109,6 +154,7 @@ class QuantumSettlementRecord:
             "execution_quantum_seed_commitment": self.execution_quantum_seed_commitment,
             "execution_temporal_window": self.execution_temporal_window,
             "broker_settlement_sig": self.broker_settlement_sig,
+            "broker_signature": self.broker_signature,
             "settlement_timestamp": self.settlement_timestamp,
             "settlement_quantum_seed_commitment": self.settlement_quantum_seed_commitment,
             "settlement_temporal_window": self.settlement_temporal_window,
@@ -126,6 +172,7 @@ class QuantumSettlementRecord:
         execution_seed_hash: str,
         execution_window: dict,
         broker_sig: str,
+        broker_signature: dict,
         quantum_seed: int | bytes,
         measurement_method: str = "OS_URANDOM",
     ) -> Tuple[dict, dict, "QuantumSettlementRecord"]:
@@ -141,6 +188,16 @@ class QuantumSettlementRecord:
             execution_seed_hash: Execution quantum seed hash.
             execution_window: Execution key temporal window.
             broker_sig: Broker's settlement acknowledgement string.
+            broker_signature: The broker's own ECDSA signature envelope
+                (produced by signing ``build_broker_attestation(order_id,
+                commitment_sig, execution_sig, broker_sig)`` with the
+                broker's key) -- proves ``broker_sig`` was actually
+                produced by whoever holds that key, rather than being an
+                arbitrary unauthenticated string embedded by the
+                settlement-phase signer themselves. Callers must also
+                register that key's pubkey in an ``AccountKeyRegistry``
+                under scope ``f"broker:{account_id}"`` for
+                ``AuditVerifier.verify_trade_flow`` to certify the flow.
             quantum_seed: THIRD quantum seed for settlement.
             measurement_method: Source of the seed.
 
@@ -159,7 +216,9 @@ class QuantumSettlementRecord:
         )
 
         # Compute flow merkle
-        flow_merkle = compute_flow_merkle(commitment_sig, execution_sig, broker_sig)
+        flow_merkle = compute_flow_merkle(
+            commitment_sig, execution_sig, broker_sig, broker_signature
+        )
 
         settlement = cls(
             order_id=order_id,
@@ -170,6 +229,7 @@ class QuantumSettlementRecord:
             execution_quantum_seed_commitment=execution_seed_hash,
             execution_temporal_window=execution_window,
             broker_settlement_sig=broker_sig,
+            broker_signature=broker_signature,
             settlement_timestamp=now,
             settlement_quantum_seed_commitment=ephemeral_key.seed_commitment.seed_hash,
             settlement_temporal_window=ephemeral_key.seed_commitment.temporal_window_dict,
@@ -209,7 +269,14 @@ class QuantumSettlementVerifier:
         Checks:
         1. Settlement references correct commitment_sig
         2. Settlement references correct execution_sig
-        3. Flow merkle hash matches recomputed value
+        3. The broker_signature envelope is a valid signature over the
+           broker attestation (order_id + commitment_sig + execution_sig
+           + broker_sig) -- i.e. broker_settlement_sig is cryptographically
+           attributable to *some* key, not an arbitrary unauthenticated
+           string. (Whether that key belongs to a *registered* broker is
+           a separate, out-of-band check -- see
+           ``AuditVerifier.verify_trade_flow``'s broker identity check.)
+        4. Flow merkle hash matches recomputed value
 
         Returns:
             True if the chain is valid.
@@ -220,7 +287,17 @@ class QuantumSettlementVerifier:
             return False
 
         broker_sig = settlement.get("broker_settlement_sig", "")
-        expected_merkle = compute_flow_merkle(commitment_sig, execution_sig, broker_sig)
+        broker_signature = settlement.get("broker_signature")
+
+        broker_attestation = build_broker_attestation(
+            settlement.get("order_id"), commitment_sig, execution_sig, broker_sig
+        )
+        if not verify_signature(broker_attestation, broker_signature or {}):
+            return False
+
+        expected_merkle = compute_flow_merkle(
+            commitment_sig, execution_sig, broker_sig, broker_signature
+        )
         return settlement.get("flow_merkle_hash") == expected_merkle
 
     @staticmethod

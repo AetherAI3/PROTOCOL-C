@@ -49,6 +49,7 @@ from aether_protocol_c.settlement import (
     QuantumSettlementRecord,
     QuantumSettlementVerifier,
     compute_flow_merkle,
+    build_broker_attestation,
 )
 from aether_protocol_c.audit import AuditLog, AuditEntry, PHASE_COMMITMENT
 from aether_protocol_c.seed import (
@@ -57,6 +58,23 @@ from aether_protocol_c.seed import (
 )
 from aether_protocol_c.verify import AuditVerifier
 from aether_protocol_c.identity import AccountKeyRegistry, IdentityError
+
+
+def sign_broker_ack(order_id, commitment_sig, execution_sig, broker_sig):
+    """
+    Build a broker signature envelope for tests: a fresh keypair signs
+    the broker attestation, standing in for a real registered broker's
+    key. Returns (broker_signature_envelope, broker_pubkey_hex).
+    """
+    seed = get_seed()
+    broker_key = QuantumEphemeralKey(
+        quantum_seed=seed.seed_int, method=seed.method
+    )
+    attestation = build_broker_attestation(
+        order_id, commitment_sig, execution_sig, broker_sig
+    )
+    broker_signature = broker_key.sign(attestation)
+    return broker_signature, broker_signature["pubkey"]
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -513,6 +531,7 @@ def test_settlement_record():
         measurement_method=seed2.method,
     )
 
+    broker_signature, _ = sign_broker_ack("settle_001", c_sig, att_sig, "broker_ack_001")
     s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
         order_id="settle_001",
         commitment_sig=c_sig,
@@ -522,6 +541,7 @@ def test_settlement_record():
         execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
         execution_window=att_dict["key_temporal_window"],
         broker_sig="broker_ack_001",
+        broker_signature=broker_signature,
         quantum_seed=seed3.seed_int,
         measurement_method=seed3.method,
     )
@@ -540,8 +560,9 @@ def test_flow_merkle_deterministic():
     c_sig = {"r": "aa" * 32, "s": "bb" * 32}
     e_sig = {"r": "cc" * 32, "s": "dd" * 32}
     broker = "ack"
-    h1 = compute_flow_merkle(c_sig, e_sig, broker)
-    h2 = compute_flow_merkle(c_sig, e_sig, broker)
+    broker_signature = {"pubkey": "02" + "ee" * 32, "r": "11" * 32, "s": "22" * 32}
+    h1 = compute_flow_merkle(c_sig, e_sig, broker, broker_signature)
+    h2 = compute_flow_merkle(c_sig, e_sig, broker, broker_signature)
     assert h1 == h2
     assert len(h1) == 64
 
@@ -724,6 +745,9 @@ def test_verify_trade_flow_missing_commitment_is_not_quantum_safe(temp_audit_pat
         measurement_method=seed2.method,
     )
 
+    broker_signature, broker_pubkey = sign_broker_ack(
+        order_id, c_sig, att_sig, "broker_ack_missing_commit"
+    )
     s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
         order_id=order_id,
         commitment_sig=c_sig,
@@ -733,6 +757,7 @@ def test_verify_trade_flow_missing_commitment_is_not_quantum_safe(temp_audit_pat
         execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
         execution_window=att_dict["key_temporal_window"],
         broker_sig="broker_ack_missing_commit",
+        broker_signature=broker_signature,
         quantum_seed=seed3.seed_int,
         measurement_method=seed3.method,
     )
@@ -748,6 +773,7 @@ def test_verify_trade_flow_missing_commitment_is_not_quantum_safe(temp_audit_pat
     registry = AccountKeyRegistry()
     registry.register(order_id, att_sig["pubkey"])
     registry.register(order_id, s_sig["pubkey"])
+    registry.register(f"broker:{order_id}", broker_pubkey)
 
     verifier = AuditVerifier()
     result = verifier.verify_trade_flow(order_id, audit, registry=registry)
@@ -950,6 +976,9 @@ def _build_full_flow(order_id: str):
         measurement_method=seed2.method,
     )
 
+    broker_signature, broker_pubkey = sign_broker_ack(
+        order_id, c_sig, att_sig, f"broker_ack_{order_id}"
+    )
     s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
         order_id=order_id,
         commitment_sig=c_sig,
@@ -959,10 +988,11 @@ def _build_full_flow(order_id: str):
         execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
         execution_window=att_dict["key_temporal_window"],
         broker_sig=f"broker_ack_{order_id}",
+        broker_signature=broker_signature,
         quantum_seed=seed3.seed_int,
         measurement_method=seed3.method,
     )
-    return c_dict, c_sig, att_dict, att_sig, s_dict, s_sig
+    return c_dict, c_sig, att_dict, att_sig, s_dict, s_sig, broker_pubkey
 
 
 def test_attacker_self_signed_flow_is_not_quantum_safe_without_registry(temp_audit_path):
@@ -983,7 +1013,7 @@ def test_attacker_self_signed_flow_is_not_quantum_safe_without_registry(temp_aud
     out-of-band identity binding.
     """
     order_id = "attacker_forged_001"
-    c_dict, c_sig, att_dict, att_sig, s_dict, s_sig = _build_full_flow(order_id)
+    c_dict, c_sig, att_dict, att_sig, s_dict, s_sig, _broker_pubkey = _build_full_flow(order_id)
 
     audit = AuditLog(temp_audit_path)
     # AuditLog.append_* accept any self-consistent envelope as-is -- this
@@ -1023,13 +1053,16 @@ def test_attacker_key_rejected_by_registry_legit_key_accepted(temp_audit_path):
 
     # ── Legitimate flow: signed with the account holder's real key ────
     legit_order = "legit_holder_001"
-    lc_dict, lc_sig, latt_dict, latt_sig, ls_dict, ls_sig = _build_full_flow(legit_order)
+    lc_dict, lc_sig, latt_dict, latt_sig, ls_dict, ls_sig, l_broker_pubkey = _build_full_flow(
+        legit_order
+    )
     # Each phase signs with its own fresh ephemeral key (by design -- P4
     # perfect forward secrecy), so all three pubkeys are registered as
     # authorised for this account/order scope.
     registry.register(legit_order, lc_sig["pubkey"])
     registry.register(legit_order, latt_sig["pubkey"])
     registry.register(legit_order, ls_sig["pubkey"])
+    registry.register(f"broker:{legit_order}", l_broker_pubkey)
 
     legit_audit = AuditLog(str(temp_audit_path) + ".legit")
     legit_audit.append_commitment(lc_dict, lc_sig)
@@ -1047,7 +1080,9 @@ def test_attacker_key_rejected_by_registry_legit_key_accepted(temp_audit_path):
     # ── Attacker forges a flow for a DIFFERENT order_id using their own
     #    fresh keypair, which was never registered for that order ─────
     forged_order = "attacker_forged_002"
-    fc_dict, fc_sig, fatt_dict, fatt_sig, fs_dict, fs_sig = _build_full_flow(forged_order)
+    fc_dict, fc_sig, fatt_dict, fatt_sig, fs_dict, fs_sig, _f_broker_pubkey = _build_full_flow(
+        forged_order
+    )
     # Registry has no entry at all for forged_order -- models an
     # attacker targeting an order/account whose real key was simply
     # never (or not yet) registered, or attempting to reuse a key that
@@ -1083,3 +1118,193 @@ def test_account_key_registry_fails_closed_when_unregistered():
     registry = AccountKeyRegistry()
     assert registry.is_authorized("acct_1", "02" + "aa" * 32) is False
     assert registry.is_registered("acct_1") is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 19. SETTLEMENT — BROKER ACKNOWLEDGEMENT AUTHENTICATION REGRESSION
+#     (LOOP-17 round 7)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_fabricated_broker_ack_rejected_by_verify_chain_and_trade_flow(
+    temp_audit_path,
+):
+    """
+    Breaker finding (round 7, HIGH, settlement-phase authentication gap):
+    broker_settlement_sig was a bare, free-form string never
+    independently authenticated anywhere. A party who legitimately
+    controls the settlement-phase signing key (already authorised in
+    the registry) could fabricate ANY broker_settlement_sig value --
+    including an empty string, or text copy-pasted from an unrelated
+    settlement -- and verify_chain / verify_trade_flow / the exported
+    dispute proof would all certify the flow as fully verified with
+    zero cryptographic proof any broker ever acknowledged it.
+
+    Arrange: build a fully valid, correctly-signed, correctly-chained
+    commitment/execution/settlement flow (registered legitimate
+    settlement-phase key), but instead of a broker_signature envelope
+    signed by a real broker key, embed a completely fabricated
+    broker_settlement_sig string signed by nothing (an empty envelope) --
+    reproducing the exact attack the finding describes.
+    Act: run QuantumSettlementVerifier.verify_chain and
+    AuditVerifier.verify_trade_flow / detect_tampering.
+    Assert: the fabricated broker ack is rejected everywhere, even
+    though every other phase and signature is perfectly valid.
+    """
+    order_id = "broker_forgery_001"
+    seed1 = get_seed()
+    seed2 = get_seed()
+    seed3 = get_seed()
+    snap = AccountSnapshot.from_dict(ACCOUNT_STATE)
+
+    c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+        order_id=order_id,
+        trade_details=TRADE_DETAILS,
+        account_state=snap,
+        quantum_seed=seed1.seed_int,
+        measurement_method=seed1.method,
+    )
+
+    er = ExecutionResult(
+        order_id=order_id, symbol="BTC", side="long", filled_qty=1, fill_price=50_000
+    )
+    snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
+
+    att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        execution_result=er,
+        new_account_state=snap_after,
+        quantum_seed=seed2.seed_int,
+        measurement_method=seed2.method,
+    )
+
+    # The settlement-phase signer fabricates a broker acknowledgement
+    # string out of thin air -- no broker key ever signed it. This
+    # models a compromised/dishonest holder of an authorised
+    # settlement-phase key minting a fake broker_settlement_sig.
+    fabricated_broker_sig = "broker fully acknowledges settlement -- trust me"
+    s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
+        order_id=order_id,
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        commitment_window=c_dict["key_temporal_window"],
+        execution_sig=att_sig,
+        execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
+        execution_window=att_dict["key_temporal_window"],
+        broker_sig=fabricated_broker_sig,
+        broker_signature={},  # no real broker key ever signed anything
+        quantum_seed=seed3.seed_int,
+        measurement_method=seed3.method,
+    )
+
+    # Unit-level: verify_chain must reject an unauthenticated broker ack
+    # even though commitment/execution references and the merkle hash
+    # were all computed self-consistently.
+    assert QuantumSettlementVerifier.verify_chain(c_sig, att_sig, s_dict) is False
+
+    audit = AuditLog(temp_audit_path)
+    audit.append_commitment(c_dict, c_sig)
+    audit.append_execution(att_dict, att_sig)
+    audit.append_settlement(s_dict, s_sig)
+
+    # Register the legitimate settlement-phase signer (and commitment/
+    # execution signers) so the ONLY failure this test isolates is the
+    # broker acknowledgement's own missing authentication.
+    registry = AccountKeyRegistry()
+    registry.register(order_id, c_sig["pubkey"])
+    registry.register(order_id, att_sig["pubkey"])
+    registry.register(order_id, s_sig["pubkey"])
+
+    verifier = AuditVerifier()
+    result = verifier.verify_trade_flow(order_id, audit, registry=registry)
+
+    assert result["commitment_valid"] is True
+    assert result["execution_valid"] is True
+    assert result["settlement_valid"] is False
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False
+
+    tamper = verifier.detect_tampering(order_id, audit, registry=registry)
+    assert tamper["tampered"] is True
+    assert any(
+        "BROKER_IDENTITY_UNVERIFIED" in issue or "BROKER_UNAUTHORIZED_KEY" in issue
+        or "SETTLEMENT_CHAIN_BROKEN" in issue
+        for issue in tamper["issues"]
+    )
+
+
+def test_broker_ack_signed_by_unregistered_key_rejected(temp_audit_path):
+    """
+    Complementary case: the broker_settlement_sig IS accompanied by a
+    real, cryptographically valid signature (verify_chain passes), but
+    that key was never registered as an authorised broker for this
+    scope -- e.g. an attacker's own fresh keypair, or a broker key
+    that's real but for a different counterparty. This proves the
+    fix requires *registered* broker identity, not merely *any* valid
+    signature.
+    """
+    order_id = "broker_unregistered_001"
+    seed1 = get_seed()
+    seed2 = get_seed()
+    seed3 = get_seed()
+    snap = AccountSnapshot.from_dict(ACCOUNT_STATE)
+
+    c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+        order_id=order_id,
+        trade_details=TRADE_DETAILS,
+        account_state=snap,
+        quantum_seed=seed1.seed_int,
+        measurement_method=seed1.method,
+    )
+
+    er = ExecutionResult(
+        order_id=order_id, symbol="BTC", side="long", filled_qty=1, fill_price=50_000
+    )
+    snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
+
+    att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        execution_result=er,
+        new_account_state=snap_after,
+        quantum_seed=seed2.seed_int,
+        measurement_method=seed2.method,
+    )
+
+    broker_signature, broker_pubkey = sign_broker_ack(
+        order_id, c_sig, att_sig, "broker_ack_real_but_unregistered"
+    )
+    s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
+        order_id=order_id,
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        commitment_window=c_dict["key_temporal_window"],
+        execution_sig=att_sig,
+        execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
+        execution_window=att_dict["key_temporal_window"],
+        broker_sig="broker_ack_real_but_unregistered",
+        broker_signature=broker_signature,
+        quantum_seed=seed3.seed_int,
+        measurement_method=seed3.method,
+    )
+
+    # verify_chain passes -- the signature is cryptographically valid.
+    assert QuantumSettlementVerifier.verify_chain(c_sig, att_sig, s_dict) is True
+
+    audit = AuditLog(temp_audit_path)
+    audit.append_commitment(c_dict, c_sig)
+    audit.append_execution(att_dict, att_sig)
+    audit.append_settlement(s_dict, s_sig)
+
+    registry = AccountKeyRegistry()
+    registry.register(order_id, c_sig["pubkey"])
+    registry.register(order_id, att_sig["pubkey"])
+    registry.register(order_id, s_sig["pubkey"])
+    # Deliberately do NOT register broker_pubkey under "broker:{order_id}".
+
+    verifier = AuditVerifier()
+    result = verifier.verify_trade_flow(order_id, audit, registry=registry)
+
+    assert result["settlement_valid"] is False
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False

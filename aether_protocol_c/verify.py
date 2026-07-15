@@ -200,7 +200,25 @@ class AuditVerifier:
             details.append(f"Settlement signature valid: {sig_ok}")
             details.append(f"Settlement identity bound (authorised signer): {identity_ok}")
 
-            settlement_valid = sig_ok and identity_ok
+            # Broker identity binding: broker_settlement_sig is a
+            # free-form acknowledgement string that, by itself, proves
+            # nothing about who produced it. It must be accompanied by
+            # a broker_signature envelope that (a) is a valid signature
+            # over the broker attestation (checked inside verify_chain
+            # below) and (b) is signed by a pubkey registered, out-of-
+            # band, as an authorised broker for this scope -- otherwise
+            # a compromised settlement-phase key could fabricate any
+            # broker acknowledgement and still pass every other check.
+            broker_signature = flow["settlement"].get("broker_signature")
+            broker_pubkey = (broker_signature or {}).get("pubkey", "")
+            broker_identity_ok = registry is not None and registry.is_authorized(
+                f"broker:{scope}", broker_pubkey
+            )
+            details.append(
+                f"Broker signature authenticated (registered broker key): {broker_identity_ok}"
+            )
+
+            settlement_valid = sig_ok and identity_ok and broker_identity_ok
 
             # Chain linkage
             if flow["commitment_sig"] is not None and flow["execution_sig"] is not None:
@@ -392,6 +410,20 @@ class AuditVerifier:
                     "TEMPORAL_WINDOW_UNSAFE: Not all keys expire before Shor's"
                 )
             _check_identity(flow["settlement_sig"], "SETTLEMENT")
+
+            broker_signature = flow["settlement"].get("broker_signature")
+            broker_pubkey = (broker_signature or {}).get("pubkey", "")
+            if registry is None:
+                issues.append(
+                    "BROKER_IDENTITY_UNVERIFIED: No identity registry supplied -- "
+                    "cannot confirm the broker acknowledgement's signing key is a "
+                    "registered broker"
+                )
+            elif not registry.is_authorized(f"broker:{scope}", broker_pubkey):
+                issues.append(
+                    "BROKER_UNAUTHORIZED_KEY: broker_settlement_sig's signing key "
+                    "is not a registered authorised broker for this scope"
+                )
 
         return {
             "order_id": order_id,
