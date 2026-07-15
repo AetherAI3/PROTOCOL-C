@@ -23,8 +23,11 @@ Security properties:
 import hashlib
 import hmac
 import json
+import logging
 import struct
 import time
+
+logger = logging.getLogger(__name__)
 
 
 # ── secp256k1 curve parameters ───────────────────────────────────────────────
@@ -47,21 +50,20 @@ B = 7
 # ── Modular arithmetic helpers ───────────────────────────────────────────────
 
 def _modinv(a: int, m: int) -> int:
-    """Modular inverse using extended Euclidean algorithm."""
-    if a < 0:
-        a = a % m
-    g, x, _ = _extended_gcd(a, m)
-    if g != 1:
-        raise ValueError("No modular inverse")
-    return x % m
+    """
+    Modular inverse via Fermat's little theorem (a^(m-2) mod m).
 
-
-def _extended_gcd(a: int, b: int) -> tuple:
-    """Extended GCD: returns (gcd, x, y) such that a*x + b*y = gcd."""
+    Requires m to be prime -- true for both P and N here. Unlike the
+    extended Euclidean algorithm (whose recursion depth and branching
+    pattern vary with the operands, including secret values), Python's
+    built-in `pow(base, exp, mod)` performs fixed-shape binary
+    exponentiation, avoiding the operand-dependent control flow that
+    made the previous implementation a timing side-channel risk.
+    """
+    a = a % m
     if a == 0:
-        return b, 0, 1
-    g, x, y = _extended_gcd(b % a, a)
-    return g, y - (b // a) * x, x
+        raise ValueError("No modular inverse")
+    return pow(a, m - 2, m)
 
 
 # ── Point on secp256k1 ──────────────────────────────────────────────────────
@@ -111,16 +113,45 @@ def _point_add(p1, p2):
     return _Point(x3, y3)
 
 
-def _point_mul(k: int, point):
-    """Scalar multiplication via double-and-add."""
-    result = INFINITY
-    addend = point
-    while k > 0:
-        if k & 1:
-            result = _point_add(result, addend)
-        addend = _point_add(addend, addend)
-        k >>= 1
-    return result
+def _point_double(p):
+    """Double a point on secp256k1 (explicit, no coordinate-equality branch)."""
+    if p is INFINITY:
+        return INFINITY
+    if p.y == 0:
+        return INFINITY
+    lam = (3 * p.x * p.x + A) * _modinv(2 * p.y, P) % P
+    x3 = (lam * lam - 2 * p.x) % P
+    y3 = (lam * (p.x - x3) - p.y) % P
+    return _Point(x3, y3)
+
+
+def _point_mul(k: int, point, bit_length: int = 256):
+    """
+    Scalar multiplication via a Montgomery-ladder-style fixed schedule.
+
+    Unlike the previous double-and-add loop -- which iterated only for
+    as many bits as `k` actually had and skipped the accumulator update
+    whenever a bit was 0 -- this walks a fixed `bit_length` (256, large
+    enough for any value < N) and performs exactly one point addition
+    and one point doubling on every iteration regardless of the bit
+    value. That keeps the operation count/sequence independent of the
+    secret scalar `k`, removing the most direct timing side-channel
+    (this is still pure Python, so it is not a cryptographic
+    constant-time guarantee, but it eliminates the "do work only when
+    bit==1" and coordinate-equality-based doubling detection that made
+    the original implementation branch directly on secret data).
+    """
+    r0 = INFINITY
+    r1 = point
+    for i in reversed(range(bit_length)):
+        bit = (k >> i) & 1
+        if bit == 0:
+            r1 = _point_add(r0, r1)
+            r0 = _point_double(r0)
+        else:
+            r0 = _point_add(r0, r1)
+            r1 = _point_double(r1)
+    return r0
 
 
 G = _Point(Gx, Gy)
@@ -210,8 +241,17 @@ class EphemeralSigner:
             hashlib.sha256,
         ).digest()
         self._privkey = int.from_bytes(key_material, "big") % N
-        if self._privkey == 0:
-            self._privkey = 1  # astronomically unlikely
+        retry_context = 0
+        while self._privkey == 0:
+            # astronomically unlikely (~1/2^256), but never fall back to a
+            # known constant like 1 — re-derive deterministically instead.
+            retry_context += 1
+            key_material = hmac.new(
+                b"aether-ephemeral-secp256k1-zero-key-retry",
+                seed_bytes + retry_context.to_bytes(4, "big"),
+                hashlib.sha256,
+            ).digest()
+            self._privkey = int.from_bytes(key_material, "big") % N
 
         # Derive public key
         self._pubkey = _point_mul(self._privkey, G)
@@ -269,7 +309,21 @@ class EphemeralSigner:
             msg_hash = hashlib.sha256(canonical.encode("utf-8")).digest()
 
             return _ecdsa_verify(pub, msg_hash, r, s)
-        except Exception:
+        except (KeyError, ValueError, TypeError) as exc:
+            # Malformed signature envelope (missing field, bad hex, wrong
+            # length, non-curve point, etc.) -- no key material is logged.
+            logger.debug(
+                "EphemeralSigner.verify() failed to parse signature envelope: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        except Exception as exc:
+            logger.debug(
+                "EphemeralSigner.verify() failed with unexpected error: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             return False
 
     def destroy(self) -> dict:
