@@ -56,6 +56,7 @@ from aether_protocol_c.seed import (
     generate_quantum_seed,
 )
 from aether_protocol_c.verify import AuditVerifier
+from aether_protocol_c.identity import AccountKeyRegistry, IdentityError
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -738,11 +739,186 @@ def test_verify_trade_flow_missing_commitment_is_not_quantum_safe(temp_audit_pat
     audit.append_execution(att_dict, att_sig)
     audit.append_settlement(s_dict, s_sig)
 
+    # Identity binding (LOOP-17 round 3) is a separate, orthogonal
+    # concern from this vacuous-truth regression: register the real
+    # signer's keys so execution/settlement pass identity too, isolating
+    # the missing-commitment-phase behaviour under test.
+    registry = AccountKeyRegistry()
+    registry.register(order_id, att_sig["pubkey"])
+    registry.register(order_id, s_sig["pubkey"])
+
     verifier = AuditVerifier()
-    result = verifier.verify_trade_flow(order_id, audit)
+    result = verifier.verify_trade_flow(order_id, audit, registry=registry)
 
     assert result["commitment_valid"] is None
     assert result["execution_valid"] is True
     assert result["settlement_valid"] is True
     assert result["chain_valid"] is False
     assert result["quantum_safe"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 18. AUDIT VERIFIER — SELF-REFERENTIAL SIGNATURE / MISSING IDENTITY BINDING
+#     REGRESSION (LOOP-17 round 3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_full_flow(order_id: str):
+    """Build and sign a complete commitment/execution/settlement flow."""
+    seed1 = get_seed()
+    seed2 = get_seed()
+    seed3 = get_seed()
+    snap = AccountSnapshot.from_dict(ACCOUNT_STATE)
+
+    c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+        order_id=order_id,
+        trade_details=TRADE_DETAILS,
+        account_state=snap,
+        quantum_seed=seed1.seed_int,
+        measurement_method=seed1.method,
+    )
+
+    er = ExecutionResult(order_id=order_id, filled_qty=1, fill_price=50_000)
+    snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
+
+    att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        execution_result=er,
+        new_account_state=snap_after,
+        quantum_seed=seed2.seed_int,
+        measurement_method=seed2.method,
+    )
+
+    s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
+        order_id=order_id,
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        commitment_window=c_dict["key_temporal_window"],
+        execution_sig=att_sig,
+        execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
+        execution_window=att_dict["key_temporal_window"],
+        broker_sig=f"broker_ack_{order_id}",
+        quantum_seed=seed3.seed_int,
+        measurement_method=seed3.method,
+    )
+    return c_dict, c_sig, att_dict, att_sig, s_dict, s_sig
+
+
+def test_attacker_self_signed_flow_is_not_quantum_safe_without_registry(temp_audit_path):
+    """
+    Breaker finding (round 3, CRITICAL, missing-identity-binding): an
+    attacker who can write to the audit log generates their OWN fresh
+    quantum-derived keypair (no private-key theft, no ECDLP break --
+    just a normal EphemeralSigner/QuantumEphemeralKey instance) and
+    self-signs a completely fabricated commitment/execution/settlement
+    flow for a victim's order_id. Every internal check (signature
+    validity, state binding, quantum binding, temporal safety, nonce
+    increment, seed independence, chain linkage) is satisfied because
+    they only validate the envelope against the pubkey embedded in that
+    SAME envelope -- a tautology. Before the fix, verify_trade_flow
+    reported this fabricated flow as quantum_safe=True/chain_valid=True,
+    which DisputeProofGenerator would then export as an "authorised"
+    trade proof. It must never be certified quantum_safe absent an
+    out-of-band identity binding.
+    """
+    order_id = "attacker_forged_001"
+    c_dict, c_sig, att_dict, att_sig, s_dict, s_sig = _build_full_flow(order_id)
+
+    audit = AuditLog(temp_audit_path)
+    # AuditLog.append_* accept any self-consistent envelope as-is -- this
+    # models the attacker directly appending a fabricated flow.
+    audit.append_commitment(c_dict, c_sig)
+    audit.append_execution(att_dict, att_sig)
+    audit.append_settlement(s_dict, s_sig)
+
+    verifier = AuditVerifier()
+
+    # No registry supplied -- there is no way to prove the account holder
+    # (as opposed to the attacker) authorised this flow, so it must fail
+    # closed even though every internal self-consistency check passes.
+    result = verifier.verify_trade_flow(order_id, audit)
+    assert result["identity_bound"] is False
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False
+
+    tamper = verifier.detect_tampering(order_id, audit)
+    assert any("IDENTITY_UNVERIFIED" in issue for issue in tamper["issues"])
+    assert tamper["tampered"] is True
+
+
+def test_attacker_key_rejected_by_registry_legit_key_accepted(temp_audit_path):
+    """
+    Same attacker scenario, but now an AccountKeyRegistry has been
+    populated out-of-band with the account holder's real signing key
+    (e.g. at onboarding). The attacker's self-signed forged flow for
+    the SAME order_id must be rejected because its embedded pubkey was
+    never registered -- while a flow legitimately signed by the
+    registered key is accepted. This proves identity binding actually
+    discriminates attacker keys from authorised keys, not just that it
+    fails closed on empty registries.
+    """
+    registry = AccountKeyRegistry()
+    verifier = AuditVerifier()
+
+    # ── Legitimate flow: signed with the account holder's real key ────
+    legit_order = "legit_holder_001"
+    lc_dict, lc_sig, latt_dict, latt_sig, ls_dict, ls_sig = _build_full_flow(legit_order)
+    # Each phase signs with its own fresh ephemeral key (by design -- P4
+    # perfect forward secrecy), so all three pubkeys are registered as
+    # authorised for this account/order scope.
+    registry.register(legit_order, lc_sig["pubkey"])
+    registry.register(legit_order, latt_sig["pubkey"])
+    registry.register(legit_order, ls_sig["pubkey"])
+
+    legit_audit = AuditLog(str(temp_audit_path) + ".legit")
+    legit_audit.append_commitment(lc_dict, lc_sig)
+    legit_audit.append_execution(latt_dict, latt_sig)
+    legit_audit.append_settlement(ls_dict, ls_sig)
+
+    legit_result = verifier.verify_trade_flow(legit_order, legit_audit, registry=registry)
+    assert legit_result["identity_bound"] is True
+    assert legit_result["commitment_valid"] is True
+    assert legit_result["execution_valid"] is True
+    assert legit_result["settlement_valid"] is True
+    assert legit_result["chain_valid"] is True
+    assert legit_result["quantum_safe"] is True
+
+    # ── Attacker forges a flow for a DIFFERENT order_id using their own
+    #    fresh keypair, which was never registered for that order ─────
+    forged_order = "attacker_forged_002"
+    fc_dict, fc_sig, fatt_dict, fatt_sig, fs_dict, fs_sig = _build_full_flow(forged_order)
+    # Registry has no entry at all for forged_order -- models an
+    # attacker targeting an order/account whose real key was simply
+    # never (or not yet) registered, or attempting to reuse a key that
+    # was never authorised for this scope.
+
+    forged_audit = AuditLog(str(temp_audit_path) + ".forged")
+    forged_audit.append_commitment(fc_dict, fc_sig)
+    forged_audit.append_execution(fatt_dict, fatt_sig)
+    forged_audit.append_settlement(fs_dict, fs_sig)
+
+    forged_result = verifier.verify_trade_flow(forged_order, forged_audit, registry=registry)
+    assert forged_result["identity_bound"] is True  # registry WAS supplied
+    assert forged_result["commitment_valid"] is False
+    assert forged_result["execution_valid"] is False
+    assert forged_result["settlement_valid"] is False
+    assert forged_result["chain_valid"] is False
+    assert forged_result["quantum_safe"] is False
+
+    forged_tamper = verifier.detect_tampering(forged_order, forged_audit, registry=registry)
+    assert any("UNAUTHORIZED_KEY" in issue for issue in forged_tamper["issues"])
+    assert forged_tamper["tampered"] is True
+
+
+def test_account_key_registry_rejects_malformed_pubkey():
+    registry = AccountKeyRegistry()
+    with pytest.raises(IdentityError):
+        registry.register("acct_1", "not-a-real-pubkey")
+    with pytest.raises(IdentityError):
+        registry.register("", "02" + "aa" * 32)
+
+
+def test_account_key_registry_fails_closed_when_unregistered():
+    registry = AccountKeyRegistry()
+    assert registry.is_authorized("acct_1", "02" + "aa" * 32) is False
+    assert registry.is_registered("acct_1") is False
