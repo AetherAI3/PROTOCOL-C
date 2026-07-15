@@ -554,8 +554,6 @@ class AuditLog:
         Returns:
             Dict with data and signature for each phase.
         """
-        entries = self.read_by_order_id(order_id)
-
         flow: Dict[str, Any] = {
             "order_id": order_id,
             "commitment": None,
@@ -569,19 +567,23 @@ class AuditLog:
             "settlement_quantum_proof": None,
         }
 
-        for entry in entries:
-            if entry.phase == PHASE_COMMITMENT:
-                flow["commitment"] = entry.data
-                flow["commitment_sig"] = entry.signature
-                flow["commitment_quantum_proof"] = entry.quantum_proof
-            elif entry.phase == PHASE_EXECUTION:
-                flow["execution"] = entry.data
-                flow["execution_sig"] = entry.signature
-                flow["execution_quantum_proof"] = entry.quantum_proof
-            elif entry.phase == PHASE_SETTLEMENT:
-                flow["settlement"] = entry.data
-                flow["settlement_sig"] = entry.signature
-                flow["settlement_quantum_proof"] = entry.quantum_proof
+        phase_to_keys = {
+            PHASE_COMMITMENT: ("commitment", "commitment_sig", "commitment_quantum_proof"),
+            PHASE_EXECUTION: ("execution", "execution_sig", "execution_quantum_proof"),
+            PHASE_SETTLEMENT: ("settlement", "settlement_sig", "settlement_quantum_proof"),
+        }
+
+        for phase, (data_key, sig_key, proof_key) in phase_to_keys.items():
+            record = self.get_by_id(f"{order_id}_{phase}")
+            if record is None:
+                continue
+            try:
+                entry = AuditEntry.from_dict(record)
+            except (KeyError, TypeError) as exc:
+                raise AuditError(f"Corrupt audit log entry: {exc}") from exc
+            flow[data_key] = entry.data
+            flow[sig_key] = entry.signature
+            flow[proof_key] = entry.quantum_proof
 
         return flow
 
