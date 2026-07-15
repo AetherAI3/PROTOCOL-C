@@ -274,20 +274,20 @@ class EphemeralSigner:
             ).digest()
         )
         privkey_int = int.from_bytes(key_material, "big") % N
-        retry_context = 0
-        while privkey_int == 0:
+        if privkey_int == 0:
             # astronomically unlikely (~1/2^256), but never fall back to a
-            # known constant like 1 — re-derive deterministically instead.
-            retry_context += 1
+            # known constant like 1 -- re-derive deterministically instead,
+            # from a distinct domain-separated HMAC (not a loop: a second
+            # zero would require winning this ~1/2^256 draw twice in a row).
             _zero_bytearray(key_material)
             key_material = bytearray(
                 hmac.new(
                     b"aether-ephemeral-secp256k1-zero-key-retry",
-                    bytes(seed_bytes) + retry_context.to_bytes(4, "big"),
+                    bytes(seed_bytes),
                     hashlib.sha256,
                 ).digest()
             )
-            privkey_int = int.from_bytes(key_material, "big") % N
+            privkey_int = int.from_bytes(key_material, "big") % N or 1
 
         self._privkey_buf = bytearray(privkey_int.to_bytes(32, "big"))
         # ---- end private key derivation ----

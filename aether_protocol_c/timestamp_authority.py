@@ -422,10 +422,14 @@ class RFC3161TimestampAuthority:
 
         return der_encoder.encode(req), nonce_val
 
-    def _extract_tst_info_nonce(self, resp_bytes: bytes) -> Optional[int]:
+    def _decode_tst_info(self, resp_bytes: bytes) -> tuple:
         """
-        Parse a raw ``TimeStampResp`` and return the ``TSTInfo.nonce``
-        value, if present.
+        Parse a raw ``TimeStampResp`` down to its embedded ``TSTInfo``.
+
+        Shared by ``_extract_tst_info_nonce`` (nonce-replay check on
+        ``stamp()``) and ``verify`` (full hash/signature verification) --
+        both need the identical decode-status-unwrap-eContent sequence,
+        so it lives here once rather than twice.
 
         The embedded ``TSTInfo`` is decoded *schemaless* (without
         ``asn1Spec=TSTInfo()``) deliberately: ``TSTInfo``'s optional
@@ -436,17 +440,16 @@ class RFC3161TimestampAuthority:
         rather than silently mis-parsing. A schemaless decode sidesteps
         this because each universally-tagged primitive (``INTEGER``,
         ``BOOLEAN``, ``SEQUENCE``, ...) is resolved directly from its own
-        DER tag, with no ambiguity to resolve. ``nonce`` is the only
-        top-level ``INTEGER``-tagged field in ``TSTInfo`` after
-        ``serialNumber``/``genTime``, so it can be found unambiguously by
-        tag once the mandatory prefix is skipped.
+        DER tag, with no ambiguity to resolve.
 
         Args:
             resp_bytes: Raw DER-encoded TimeStampResp bytes.
 
         Returns:
-            The nonce value echoed by the TSA, or ``None`` if the
-            TSTInfo has no nonce field.
+            ``(tst_info, signed_data_der)`` -- the schemaless-decoded
+            TSTInfo structure, and the raw DER bytes of the CMS
+            ``SignedData`` it came from (needed by callers that go on to
+            verify the CMS signature).
 
         Raises:
             TimestampError: If the response cannot be parsed, does not
@@ -480,15 +483,6 @@ class RFC3161TimestampAuthority:
 
             # Schemaless decode -- see docstring above.
             tst_info, _ = der_decoder.decode(bytes(econtent))
-
-            # Mandatory prefix: version, policy, messageImprint,
-            # serialNumber, genTime -- always exactly 5 components.
-            nonce_val: Optional[int] = None
-            for i in range(5, len(tst_info)):
-                component = tst_info.getComponentByPosition(i)
-                if isinstance(component, univ.Integer):
-                    nonce_val = int(component)
-                    break
         except TimestampError:
             raise
         except Exception as exc:
@@ -496,7 +490,37 @@ class RFC3161TimestampAuthority:
                 f"Failed to parse TSA response: {exc}"
             ) from exc
 
-        return nonce_val
+        return tst_info, signed_data_der
+
+    def _extract_tst_info_nonce(self, resp_bytes: bytes) -> Optional[int]:
+        """
+        Parse a raw ``TimeStampResp`` and return the ``TSTInfo.nonce``
+        value, if present.
+
+        ``nonce`` is the only top-level ``INTEGER``-tagged field in
+        ``TSTInfo`` after ``serialNumber``/``genTime``, so it can be found
+        unambiguously by tag once the mandatory prefix is skipped.
+
+        Args:
+            resp_bytes: Raw DER-encoded TimeStampResp bytes.
+
+        Returns:
+            The nonce value echoed by the TSA, or ``None`` if the
+            TSTInfo has no nonce field.
+
+        Raises:
+            TimestampError: If the response cannot be parsed, does not
+                report a granted status, or is missing the timestamp token.
+        """
+        tst_info, _ = self._decode_tst_info(resp_bytes)
+
+        # Mandatory prefix: version, policy, messageImprint,
+        # serialNumber, genTime -- always exactly 5 components.
+        for i in range(5, len(tst_info)):
+            component = tst_info.getComponentByPosition(i)
+            if isinstance(component, univ.Integer):
+                return int(component)
+        return None
 
     def _verify_cms_signature(self, content_info_content: bytes) -> bool:
         """
@@ -867,36 +891,11 @@ class RFC3161TimestampAuthority:
         expected_digest = hashlib.sha256(data).digest()
 
         try:
-            resp, _ = der_decoder.decode(token.token_bytes, asn1Spec=TimeStampResp())
-
-            status = int(resp.getComponentByName("status").getComponentByName("status"))
-            if status not in (0, 1):  # 0=granted, 1=grantedWithMods
-                return False
-
-            content_info = resp.getComponentByName("timeStampToken")
-            if content_info is None or not content_info.hasValue():
-                return False
-
-            signed_data_der = bytes(content_info.getComponentByName("content"))
-            signed_data, _ = der_decoder.decode(
-                signed_data_der, asn1Spec=SignedData()
-            )
-
-            econtent = signed_data.getComponentByName(
-                "encapContentInfo"
-            ).getComponentByName("eContent")
-            if econtent is None or not econtent.hasValue():
-                return False
-
-            # Schemaless decode -- see `_extract_tst_info_nonce`'s docstring:
-            # pyasn1's schema-mode TSTInfo() decoder cannot reliably
-            # disambiguate later optional/default fields (accuracy,
-            # ordering) from an included `nonce` when earlier optional
-            # fields are DER-omitted, and raises rather than risk a wrong
-            # parse. `messageImprint` is always the mandatory 3rd component
-            # (position 2), so it can be read positionally without
-            # depending on which trailing optional fields are present.
-            tst_info, _ = der_decoder.decode(bytes(econtent))
+            # `messageImprint` is always the mandatory 3rd component
+            # (position 2) of TSTInfo, so it can be read positionally
+            # without depending on which trailing optional fields
+            # (accuracy, ordering, nonce) are present.
+            tst_info, signed_data_der = self._decode_tst_info(token.token_bytes)
             message_imprint = tst_info.getComponentByPosition(2)
             tsa_hashed_message = bytes(message_imprint.getComponentByPosition(1))
         except Exception:

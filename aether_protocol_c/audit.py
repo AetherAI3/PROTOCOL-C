@@ -583,18 +583,39 @@ class AuditLog:
             PHASE_EXECUTION: ("execution", "execution_sig", "execution_quantum_proof"),
             PHASE_SETTLEMENT: ("settlement", "settlement_sig", "settlement_quantum_proof"),
         }
+        keys_by_record_id = {
+            f"{order_id}_{phase}": keys for phase, keys in phase_to_keys.items()
+        }
 
-        for phase, (data_key, sig_key, proof_key) in phase_to_keys.items():
-            record = self.get_by_id(f"{order_id}_{phase}")
-            if record is None:
-                continue
-            try:
-                entry = AuditEntry.from_dict(record)
-            except (KeyError, TypeError) as exc:
-                raise AuditError(f"Corrupt audit log entry: {exc}") from exc
-            flow[data_key] = entry.data
-            flow[sig_key] = entry.signature
-            flow[proof_key] = entry.quantum_proof
+        # Single indexed query + single file open for all three phases,
+        # instead of three separate get_by_id() round-trips -- still O(1)
+        # indexed lookups (no full-file scan), just batched.
+        placeholders = ",".join("?" * len(keys_by_record_id))
+        cur = self._conn.execute(
+            f"SELECT record_id, jsonl_offset FROM audit_index WHERE record_id IN ({placeholders})",
+            list(keys_by_record_id),
+        )
+        offsets_by_record_id = {row[0]: row[1] for row in cur.fetchall()}
+
+        if offsets_by_record_id:
+            with open(self._path, "rb") as f:
+                for record_id, offset in offsets_by_record_id.items():
+                    data_key, sig_key, proof_key = keys_by_record_id[record_id]
+                    f.seek(offset)
+                    raw = f.readline()
+                    if not raw:
+                        continue
+                    try:
+                        record = json.loads(raw.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    try:
+                        entry = AuditEntry.from_dict(record)
+                    except (KeyError, TypeError) as exc:
+                        raise AuditError(f"Corrupt audit log entry: {exc}") from exc
+                    flow[data_key] = entry.data
+                    flow[sig_key] = entry.signature
+                    flow[proof_key] = entry.quantum_proof
 
         return flow
 

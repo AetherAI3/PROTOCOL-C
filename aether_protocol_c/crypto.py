@@ -307,6 +307,10 @@ def verify_signature(message: dict, signature: dict) -> bool:
         # verify_static() only parses the pubkey embedded in the signature
         # envelope -- no private key is derived, unlike constructing a
         # throwaway EphemeralSigner just to call its instance verify().
+        # This try/except is a deliberate second fail-closed layer, not
+        # pure duplication of verify_static's own -- it also catches
+        # unexpected failures at the call boundary itself (e.g. a caller
+        # substituting a broken verify_static implementation).
         return EphemeralSigner.verify_static(message, signature)
     except (KeyError, ValueError, TypeError) as exc:
         # Malformed signature envelope (missing field, bad hex, wrong

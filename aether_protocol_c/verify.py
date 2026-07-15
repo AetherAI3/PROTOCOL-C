@@ -211,8 +211,8 @@ class AuditVerifier:
             # broker acknowledgement and still pass every other check.
             broker_signature = flow["settlement"].get("broker_signature")
             broker_pubkey = (broker_signature or {}).get("pubkey", "")
-            broker_identity_ok = registry is not None and registry.is_authorized(
-                f"broker:{scope}", broker_pubkey
+            broker_identity_ok = registry is not None and registry.is_broker_authorized(
+                scope, broker_pubkey
             )
             details.append(
                 f"Broker signature authenticated (registered broker key): {broker_identity_ok}"
@@ -419,7 +419,7 @@ class AuditVerifier:
                     "cannot confirm the broker acknowledgement's signing key is a "
                     "registered broker"
                 )
-            elif not registry.is_authorized(f"broker:{scope}", broker_pubkey):
+            elif not registry.is_broker_authorized(scope, broker_pubkey):
                 issues.append(
                     "BROKER_UNAUTHORIZED_KEY: broker_settlement_sig's signing key "
                     "is not a registered authorised broker for this scope"

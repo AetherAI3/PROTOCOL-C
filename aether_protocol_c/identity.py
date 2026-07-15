@@ -113,6 +113,18 @@ class AccountKeyRegistry:
         """Whether ``account_id`` has any registered keys at all."""
         return bool(self._authorized.get(account_id))
 
+    def is_broker_authorized(self, scope: str, pubkey_hex: str) -> bool:
+        """
+        Check whether ``pubkey_hex`` is a registered broker key for ``scope``.
+
+        Brokers are registered under a separate ``"broker:" + scope``
+        namespace from account signers (see ``register``), so a
+        compromised account-signer key can never also pass as an
+        authorised broker key. Callers must use this instead of
+        re-deriving the ``"broker:"`` prefix at each call site.
+        """
+        return self.is_authorized(f"broker:{scope}", pubkey_hex)
+
     def get_authorized_pubkeys(self, account_id: str) -> FrozenSet[str]:
         """Return the frozen set of pubkeys authorised for ``account_id``."""
         return frozenset(self._authorized.get(account_id, set()))

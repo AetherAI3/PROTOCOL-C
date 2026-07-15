@@ -289,16 +289,19 @@ class QuantumSettlementVerifier:
         broker_sig = settlement.get("broker_settlement_sig", "")
         broker_signature = settlement.get("broker_signature")
 
-        broker_attestation = build_broker_attestation(
-            settlement.get("order_id"), commitment_sig, execution_sig, broker_sig
-        )
-        if not verify_signature(broker_attestation, broker_signature or {}):
-            return False
-
+        # Cheap hash comparison first -- short-circuits before paying for
+        # the ECDSA verify below on a settlement whose merkle hash doesn't
+        # even match (e.g. already-tampered/mismatched input).
         expected_merkle = compute_flow_merkle(
             commitment_sig, execution_sig, broker_sig, broker_signature
         )
-        return settlement.get("flow_merkle_hash") == expected_merkle
+        if settlement.get("flow_merkle_hash") != expected_merkle:
+            return False
+
+        broker_attestation = build_broker_attestation(
+            settlement.get("order_id"), commitment_sig, execution_sig, broker_sig
+        )
+        return verify_signature(broker_attestation, broker_signature or {})
 
     @staticmethod
     def verify_all_seeds_independent(settlement: dict) -> bool:
