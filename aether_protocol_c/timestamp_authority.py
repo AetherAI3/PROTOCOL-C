@@ -77,6 +77,114 @@ if _PYASN1_AVAILABLE:
     # OID for SHA-256
     _SHA256_OID = univ.ObjectIdentifier((2, 16, 840, 1, 101, 3, 4, 2, 1))
 
+    class PKIStatusInfo(univ.Sequence):
+        """ASN.1 PKIStatusInfo ::= SEQUENCE { status, statusString OPTIONAL, failInfo OPTIONAL }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("status", univ.Integer()),
+            namedtype.OptionalNamedType(
+                "statusString", univ.SequenceOf(componentType=univ.Any())
+            ),
+            namedtype.OptionalNamedType("failInfo", univ.BitString()),
+        )
+
+    class ContentInfo(univ.Sequence):
+        """ASN.1 ContentInfo ::= SEQUENCE { contentType, content [0] EXPLICIT ANY }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("contentType", univ.ObjectIdentifier()),
+            namedtype.OptionalNamedType(
+                "content",
+                univ.Any().subtype(
+                    explicitTag=tag.Tag(
+                        tag.tagClassContext, tag.tagFormatConstructed, 0
+                    )
+                ),
+            ),
+        )
+
+    class TimeStampResp(univ.Sequence):
+        """ASN.1 TimeStampResp ::= SEQUENCE { status, timeStampToken OPTIONAL }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("status", PKIStatusInfo()),
+            namedtype.OptionalNamedType("timeStampToken", ContentInfo()),
+        )
+
+    class AlgorithmIdentifier(univ.Sequence):
+        """ASN.1 AlgorithmIdentifier ::= SEQUENCE { algorithm, parameters OPTIONAL }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("algorithm", univ.ObjectIdentifier()),
+            namedtype.OptionalNamedType("parameters", univ.Any()),
+        )
+
+    class EncapsulatedContentInfo(univ.Sequence):
+        """ASN.1 EncapsulatedContentInfo ::= SEQUENCE { eContentType, eContent [0] EXPLICIT OCTET STRING OPTIONAL }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("eContentType", univ.ObjectIdentifier()),
+            namedtype.OptionalNamedType(
+                "eContent",
+                univ.OctetString().subtype(
+                    explicitTag=tag.Tag(
+                        tag.tagClassContext, tag.tagFormatSimple, 0
+                    )
+                ),
+            ),
+        )
+
+    class SignedData(univ.Sequence):
+        """ASN.1 SignedData (CMS) ::= SEQUENCE { version, digestAlgorithms, encapContentInfo, certificates OPTIONAL, crls OPTIONAL, signerInfos }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("version", univ.Integer()),
+            namedtype.NamedType(
+                "digestAlgorithms", univ.SetOf(componentType=AlgorithmIdentifier())
+            ),
+            namedtype.NamedType("encapContentInfo", EncapsulatedContentInfo()),
+            namedtype.OptionalNamedType(
+                "certificates",
+                univ.Any().subtype(
+                    implicitTag=tag.Tag(
+                        tag.tagClassContext, tag.tagFormatConstructed, 0
+                    )
+                ),
+            ),
+            namedtype.OptionalNamedType(
+                "crls",
+                univ.Any().subtype(
+                    implicitTag=tag.Tag(
+                        tag.tagClassContext, tag.tagFormatConstructed, 1
+                    )
+                ),
+            ),
+            namedtype.NamedType("signerInfos", univ.SetOf(componentType=univ.Any())),
+        )
+
+    class TSTInfo(univ.Sequence):
+        """ASN.1 TSTInfo ::= SEQUENCE { version, policy, messageImprint, serialNumber, genTime, ... }"""
+        componentType = namedtype.NamedTypes(
+            namedtype.NamedType("version", univ.Integer()),
+            namedtype.NamedType("policy", univ.ObjectIdentifier()),
+            namedtype.NamedType("messageImprint", MessageImprint()),
+            namedtype.NamedType("serialNumber", univ.Integer()),
+            namedtype.NamedType("genTime", useful.GeneralizedTime()),
+            namedtype.OptionalNamedType("accuracy", univ.Any()),
+            namedtype.DefaultedNamedType("ordering", univ.Boolean(False)),
+            namedtype.OptionalNamedType("nonce", univ.Integer()),
+            namedtype.OptionalNamedType(
+                "tsa",
+                univ.Any().subtype(
+                    implicitTag=tag.Tag(
+                        tag.tagClassContext, tag.tagFormatConstructed, 0
+                    )
+                ),
+            ),
+            namedtype.OptionalNamedType(
+                "extensions",
+                univ.Any().subtype(
+                    implicitTag=tag.Tag(
+                        tag.tagClassContext, tag.tagFormatConstructed, 1
+                    )
+                ),
+            ),
+        )
+
 
 # ── Data classes ──────────────────────────────────────────────────────
 
@@ -145,18 +253,96 @@ class RFC3161TimestampAuthority:
         timeout: HTTP request timeout in seconds.
     """
 
-    DEFAULT_TSA_URL = "http://timestamp.digicert.com"
-    FALLBACK_TSA_URL = "http://timestamp.sectigo.com"
+    DEFAULT_TSA_URL = "https://timestamp.digicert.com"
+    FALLBACK_TSA_URL = "https://timestamp.sectigo.com"
 
     def __init__(
         self,
         tsa_url: Optional[str] = None,
         fallback_url: Optional[str] = None,
         timeout: int = 10,
+        allow_insecure_http: bool = False,
     ) -> None:
-        self._tsa_url = tsa_url or self.DEFAULT_TSA_URL
-        self._fallback_url = fallback_url or self.FALLBACK_TSA_URL
+        """
+        Args:
+            tsa_url: Primary TSA endpoint URL. Must be ``https://`` unless
+                ``allow_insecure_http`` is set.
+            fallback_url: Fallback TSA endpoint URL. Same scheme rule applies.
+            timeout: HTTP request timeout in seconds.
+            allow_insecure_http: Explicit opt-in to permit plain ``http://``
+                TSA URLs (e.g. for local testing). Defaults to False.
+
+        Raises:
+            TimestampError: If either URL fails scheme or host validation.
+        """
+        self._allow_insecure_http = allow_insecure_http
+        self._tsa_url = self._validate_tsa_url(tsa_url or self.DEFAULT_TSA_URL)
+        self._fallback_url = self._validate_tsa_url(
+            fallback_url or self.FALLBACK_TSA_URL
+        )
         self._timeout = timeout
+
+    def _validate_tsa_url(self, url: str) -> str:
+        """
+        Validate a TSA URL's scheme and reject private/loopback/link-local
+        hosts, guarding against SSRF and man-in-the-middle interception.
+
+        Args:
+            url: The TSA URL to validate.
+
+        Returns:
+            The validated URL, unchanged.
+
+        Raises:
+            TimestampError: If the URL uses a disallowed scheme, has no
+                host, or targets a private/loopback/link-local address.
+        """
+        import ipaddress
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+
+        if parsed.scheme == "http" and not self._allow_insecure_http:
+            raise TimestampError(
+                f"Insecure TSA URL rejected: {url!r}. TSA endpoints must "
+                "use https:// (pass allow_insecure_http=True to override "
+                "for testing)."
+            )
+        if parsed.scheme not in ("http", "https"):
+            raise TimestampError(
+                f"TSA URL {url!r} must use http:// or https://."
+            )
+        if not parsed.hostname:
+            raise TimestampError(f"TSA URL {url!r} has no host.")
+
+        host = parsed.hostname
+        try:
+            addrs = {info[4][0] for info in socket.getaddrinfo(host, None)}
+        except socket.gaierror:
+            # Hostname doesn't resolve; try treating it as a literal IP.
+            addrs = {host}
+
+        for addr in addrs:
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                raise TimestampError(
+                    f"TSA URL {url!r} resolves to a disallowed address "
+                    f"({addr}); private/loopback/link-local targets are "
+                    "not permitted."
+                )
+
+        return url
 
     def _build_timestamp_request(self, data: bytes) -> bytes:
         """
@@ -281,19 +467,83 @@ class RFC3161TimestampAuthority:
         """
         Verify that a timestamp token matches the given data.
 
-        Checks that the ``message_imprint`` stored in the token matches
-        the SHA-256 of ``data``.  This is a local verification -- it
-        confirms data integrity but does not re-contact the TSA.
+        This performs an actual ASN.1 decode of the TSA's raw response
+        (``token.token_bytes``) -- not just a comparison against the
+        caller-supplied, self-asserted ``token.message_imprint`` field.
+        Specifically it:
 
-        For full TSA certificate chain verification, use a dedicated
-        PKI library.
+        1. Decodes ``token_bytes`` as an RFC 3161 ``TimeStampResp`` and
+           confirms the TSA reported a granted status.
+        2. Unwraps the embedded CMS ``SignedData`` / ``encapContentInfo``
+           to recover the DER-encoded ``TSTInfo`` the TSA actually signed.
+        3. Extracts the ``messageImprint.hashedMessage`` field *from that
+           TSTInfo* -- i.e. the hash the TSA itself attested to -- and
+           requires it to equal ``sha256(data)``.
+
+        This defeats a malicious/compromised TSA (or network attacker)
+        returning arbitrary ``token_bytes`` alongside a self-computed
+        ``message_imprint``: without a genuine TSA response whose embedded
+        TSTInfo hash matches the data, verification now fails.
+
+        Note: this does **not** verify the CMS ``SignerInfo`` signature or
+        the TSA certificate chain -- it only cryptographically parses and
+        checks the content the signature covers.  For full trust-chain
+        verification, pair this with a dedicated PKI/CMS library.
 
         Args:
             data: The original data that was timestamped.
             token: The :class:`TimestampToken` to verify.
 
         Returns:
-            ``True`` if the imprint matches; ``False`` otherwise.
+            ``True`` if the TSA's own signed TSTInfo hash matches
+            ``sha256(data)``; ``False`` otherwise (including on any
+            malformed/unparsable response).
+
+        Raises:
+            TimestampError: If pyasn1 is not available.
         """
-        expected = hashlib.sha256(data).hexdigest()
-        return expected == token.message_imprint
+        if not _PYASN1_AVAILABLE:
+            raise TimestampError(
+                "pyasn1 is required to verify RFC 3161 timestamps.  "
+                "Install with:  pip install pyasn1"
+            )
+
+        expected_digest = hashlib.sha256(data).digest()
+
+        try:
+            resp, _ = der_decoder.decode(token.token_bytes, asn1Spec=TimeStampResp())
+
+            status = int(resp.getComponentByName("status").getComponentByName("status"))
+            if status not in (0, 1):  # 0=granted, 1=grantedWithMods
+                return False
+
+            content_info = resp.getComponentByName("timeStampToken")
+            if content_info is None or not content_info.hasValue():
+                return False
+
+            signed_data_der = bytes(content_info.getComponentByName("content"))
+            signed_data, _ = der_decoder.decode(
+                signed_data_der, asn1Spec=SignedData()
+            )
+
+            econtent = signed_data.getComponentByName(
+                "encapContentInfo"
+            ).getComponentByName("eContent")
+            if econtent is None or not econtent.hasValue():
+                return False
+
+            tst_info, _ = der_decoder.decode(bytes(econtent), asn1Spec=TSTInfo())
+            tsa_hashed_message = bytes(
+                tst_info.getComponentByName("messageImprint").getComponentByName(
+                    "hashedMessage"
+                )
+            )
+        except Exception:
+            # Malformed/unparsable TSA response -- cannot be trusted.
+            return False
+
+        if tsa_hashed_message != expected_digest:
+            return False
+
+        # Sanity-check the locally recorded imprint is consistent too.
+        return token.message_imprint == expected_digest.hex()
