@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -201,6 +202,12 @@ class AuditLog:
 
         # Set before _init_db so close()/__del__ are safe even if init fails.
         self._conn = None
+
+        # Guards the append/rotate critical section (JSONL write + SQLite
+        # index write + _line_count read-modify-write) so concurrent
+        # threads sharing one AuditLog (check_same_thread=False signals
+        # this is expected) cannot race on the same line number / offset.
+        self._append_lock = threading.RLock()
 
         # Initialise SQLite index
         self._init_db()
@@ -415,24 +422,28 @@ class AuditLog:
         Writes to the JSONL file (binary mode for reliable byte offsets)
         and indexes the entry in SQLite.
         """
-        # Check rotation before writing (but not for rotation entries
-        # themselves, to avoid infinite recursion)
-        if entry.phase != "LOG_ROTATION":
-            self._maybe_rotate()
+        # Serialize the whole read-modify-write critical section: rotation
+        # check, JSONL append, SQLite index write, and _line_count bump
+        # must be atomic w.r.t. other threads sharing this AuditLog.
+        with self._append_lock:
+            # Check rotation before writing (but not for rotation entries
+            # themselves, to avoid infinite recursion)
+            if entry.phase != "LOG_ROTATION":
+                self._maybe_rotate()
 
-        line = json.dumps(
-            entry.to_json(), sort_keys=True, separators=(",", ":")
-        )
+            line = json.dumps(
+                entry.to_json(), sort_keys=True, separators=(",", ":")
+            )
 
-        # Write to JSONL in binary mode for reliable byte offsets
-        with open(self._path, "ab") as f:
-            offset = f.tell()
-            f.write((line + "\n").encode("utf-8"))
+            # Write to JSONL in binary mode for reliable byte offsets
+            with open(self._path, "ab") as f:
+                offset = f.tell()
+                f.write((line + "\n").encode("utf-8"))
 
-        # Index in SQLite
-        self._index_entry(entry, offset, self._line_count)
-        self._conn.commit()
-        self._line_count += 1
+            # Index in SQLite
+            self._index_entry(entry, offset, self._line_count)
+            self._conn.commit()
+            self._line_count += 1
 
     def append_commitment(
         self, commitment: dict, signature: dict
