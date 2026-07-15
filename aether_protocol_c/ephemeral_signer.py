@@ -11,12 +11,15 @@ Lifecycle:
     signer = EphemeralSigner(quantum_seed=...)
     sig    = signer.sign_manifest(manifest_dict)
     ok     = signer.verify(manifest_dict, sig)
-    signer.destroy()   # zeroes private key from memory
+    signer.destroy()   # best-effort zeroing of private key buffer
 
 Security properties:
     - Private key derived from quantum entropy via HMAC-SHA256
     - Key NEVER written to disk
-    - destroy() zeroes key material in-place
+    - destroy() overwrites the private key's backing bytearray in-place
+      (best-effort only -- CPython's GC/refcounting may still leave
+      copies elsewhere in the process image; no guarantee against a
+      memory dump taken before destroy() runs)
     - Ephemeral: one key per session, discarded at end
 """
 
@@ -157,6 +160,21 @@ def _point_mul(k: int, point, bit_length: int = 256):
 G = _Point(Gx, Gy)
 
 
+def _zero_bytearray(buf: bytearray) -> None:
+    """
+    Overwrite a mutable buffer's bytes in place.
+
+    Best-effort only: in a managed-memory runtime like CPython this does
+    not guarantee the value never existed elsewhere in the process image
+    (the garbage collector, refcounting, or interpreter internals may
+    still have made copies), but it does eliminate the *known* long-lived
+    copy this module controls directly, which a bare `= 0` rebind on an
+    immutable int/bytes object never touches.
+    """
+    for i in range(len(buf)):
+        buf[i] = 0
+
+
 # ── RFC 6979 deterministic k ────────────────────────────────────────────────
 
 def _rfc6979_k(privkey: int, msg_hash: bytes) -> int:
@@ -233,28 +251,51 @@ class EphemeralSigner:
         self._destroyed = False
         self._sign_count = 0
 
-        # Derive private key from quantum seed via HMAC-SHA256
-        seed_bytes = quantum_seed.to_bytes(32, "big")
-        key_material = hmac.new(
-            b"aether-ephemeral-secp256k1",
-            seed_bytes,
-            hashlib.sha256,
-        ).digest()
-        self._privkey = int.from_bytes(key_material, "big") % N
+        # Derive private key from quantum seed via HMAC-SHA256.
+        # Held in a mutable bytearray (not a bare int/bytes object) so
+        # destroy() can overwrite the actual backing buffer in place --
+        # Python ints and bytes are immutable and can't be zeroed after
+        # the fact, only rebound to a new object, which leaves the
+        # original value sitting on the heap.
+        seed_bytes = bytearray(quantum_seed.to_bytes(32, "big"))
+        key_material = bytearray(
+            hmac.new(
+                b"aether-ephemeral-secp256k1",
+                bytes(seed_bytes),
+                hashlib.sha256,
+            ).digest()
+        )
+        privkey_int = int.from_bytes(key_material, "big") % N
         retry_context = 0
-        while self._privkey == 0:
+        while privkey_int == 0:
             # astronomically unlikely (~1/2^256), but never fall back to a
             # known constant like 1 — re-derive deterministically instead.
             retry_context += 1
-            key_material = hmac.new(
-                b"aether-ephemeral-secp256k1-zero-key-retry",
-                seed_bytes + retry_context.to_bytes(4, "big"),
-                hashlib.sha256,
-            ).digest()
-            self._privkey = int.from_bytes(key_material, "big") % N
+            _zero_bytearray(key_material)
+            key_material = bytearray(
+                hmac.new(
+                    b"aether-ephemeral-secp256k1-zero-key-retry",
+                    bytes(seed_bytes) + retry_context.to_bytes(4, "big"),
+                    hashlib.sha256,
+                ).digest()
+            )
+            privkey_int = int.from_bytes(key_material, "big") % N
+
+        self._privkey_buf = bytearray(privkey_int.to_bytes(32, "big"))
 
         # Derive public key
         self._pubkey = _point_mul(self._privkey, G)
+
+        # The seed and HMAC digest are intermediate copies of key material
+        # that are no longer needed once the private key buffer above is
+        # populated -- wipe them immediately rather than leaving them on
+        # the heap for the lifetime of the object.
+        _zero_bytearray(seed_bytes)
+        _zero_bytearray(key_material)
+
+    @property
+    def _privkey(self) -> int:
+        return int.from_bytes(self._privkey_buf, "big")
 
     @property
     def public_key_hex(self) -> str:
@@ -288,6 +329,20 @@ class EphemeralSigner:
 
     def verify(self, manifest: dict, signature: dict) -> bool:
         """Verify a signature envelope against a manifest dict."""
+        return EphemeralSigner.verify_static(manifest, signature)
+
+    @staticmethod
+    def verify_static(manifest: dict, signature: dict) -> bool:
+        """
+        Verify a signature envelope against a manifest dict.
+
+        This is a pure function of the signature envelope's embedded public
+        key -- it never derives or holds any private key material, so
+        callers that only need to verify (no signing) should use this
+        instead of instantiating an EphemeralSigner, which would otherwise
+        pointlessly derive a throwaway private key and perform an EC point
+        multiplication on every call.
+        """
         try:
             r = int(signature["r"], 16)
             s = int(signature["s"], 16)
@@ -313,27 +368,37 @@ class EphemeralSigner:
             # Malformed signature envelope (missing field, bad hex, wrong
             # length, non-curve point, etc.) -- no key material is logged.
             logger.debug(
-                "EphemeralSigner.verify() failed to parse signature envelope: %s: %s",
+                "EphemeralSigner.verify_static() failed to parse signature envelope: %s: %s",
                 type(exc).__name__,
                 exc,
             )
             return False
         except Exception as exc:
             logger.debug(
-                "EphemeralSigner.verify() failed with unexpected error: %s: %s",
+                "EphemeralSigner.verify_static() failed with unexpected error: %s: %s",
                 type(exc).__name__,
                 exc,
             )
             return False
 
     def destroy(self) -> dict:
-        """Zero private key material. Returns destruction receipt."""
+        """
+        Zero private key material in-place (best-effort).
+
+        Overwrites the mutable bytearray backing the private key so the
+        actual scalar bytes are gone from this buffer, not merely
+        rebound to a new object. This is still a best-effort operation
+        in a managed-memory language: it does not guarantee against
+        copies made elsewhere by the GC, refcounting, or interpreter
+        internals, and offers no protection against a memory dump taken
+        before destroy() runs.
+        """
         receipt = {
             "destroyed": True,
             "sign_count": self._sign_count,
             "lifetime_seconds": round(time.time() - self._created_at, 2),
         }
-        self._privkey = 0
+        _zero_bytearray(self._privkey_buf)
         self._destroyed = True
         return receipt
 
