@@ -117,13 +117,21 @@ def _point_add(p1, p2):
 
 
 def _point_double(p):
-    """Double a point on secp256k1 (explicit, no coordinate-equality branch)."""
+    """
+    Double a point on secp256k1 (explicit, no coordinate-equality branch).
+
+    Tangent-line slope at (x, y) on y^2 = x^3 + A*x + B is the standard
+    calculus derivative dy/dx = (3x^2 + A) / (2y) -- the 3 and 2 below are
+    that fixed textbook formula, not arbitrary/tunable values.
+    """
     if p is INFINITY:
         return INFINITY
     if p.y == 0:
         return INFINITY
-    lam = (3 * p.x * p.x + A) * _modinv(2 * p.y, P) % P
-    x3 = (lam * lam - 2 * p.x) % P
+    SLOPE_NUMERATOR_X_COEFF = 3    # d/dx(x^3) = 3x^2
+    SLOPE_DENOMINATOR_Y_COEFF = 2  # d/dy(y^2) = 2y
+    lam = (SLOPE_NUMERATOR_X_COEFF * p.x * p.x + A) * _modinv(SLOPE_DENOMINATOR_Y_COEFF * p.y, P) % P
+    x3 = (lam * lam - SLOPE_DENOMINATOR_Y_COEFF * p.x) % P
     y3 = (lam * (p.x - x3) - p.y) % P
     return _Point(x3, y3)
 
@@ -251,7 +259,7 @@ class EphemeralSigner:
         self._destroyed = False
         self._sign_count = 0
 
-        # Derive private key from quantum seed via HMAC-SHA256.
+        # ---- private key derivation (quantum seed -> HMAC-SHA256) ----
         # Held in a mutable bytearray (not a bare int/bytes object) so
         # destroy() can overwrite the actual backing buffer in place --
         # Python ints and bytes are immutable and can't be zeroed after
@@ -282,6 +290,7 @@ class EphemeralSigner:
             privkey_int = int.from_bytes(key_material, "big") % N
 
         self._privkey_buf = bytearray(privkey_int.to_bytes(32, "big"))
+        # ---- end private key derivation ----
 
         # Derive public key
         self._pubkey = _point_mul(self._privkey, G)

@@ -29,12 +29,19 @@ from __future__ import annotations
 import re
 from typing import Dict, FrozenSet, Set
 
+# ── Compressed secp256k1 pubkey format ───────────────────────────────────────
+# 33-byte compressed key: "02"/"03" prefix + 32-byte x-coordinate, as hex.
+
 _PUBKEY_RE = re.compile(r"^(02|03)[0-9a-f]{64}$")
 
+
+# ── Errors ────────────────────────────────────────────────────────────────
 
 class IdentityError(Exception):
     """Raised when identity registry operations fail."""
 
+
+# ── Account -> authorised-key registry ───────────────────────────────────────
 
 class AccountKeyRegistry:
     """
@@ -50,6 +57,8 @@ class AccountKeyRegistry:
 
     def __init__(self) -> None:
         self._authorized: Dict[str, Set[str]] = {}
+
+    # -- mutation: register / revoke --
 
     def register(self, account_id: str, pubkey_hex: str) -> None:
         """
@@ -75,6 +84,8 @@ class AccountKeyRegistry:
     def revoke(self, account_id: str, pubkey_hex: str) -> None:
         """Remove a previously registered key for ``account_id``."""
         self._authorized.get(account_id, set()).discard(pubkey_hex.lower())
+
+    # -- query: fail-closed authorization checks --
 
     def is_authorized(self, account_id: str, pubkey_hex: str) -> bool:
         """
