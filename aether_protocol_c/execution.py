@@ -47,6 +47,8 @@ class ExecutionResult:
 
     Fields:
         order_id: The order that was executed.
+        symbol: The instrument that was actually filled.
+        side: The actual fill direction ("BUY"/"SELL", etc.).
         filled_qty: Quantity actually filled.
         fill_price: Price at which the fill occurred.
         execution_timestamp: Unix timestamp of execution.
@@ -54,6 +56,8 @@ class ExecutionResult:
     """
 
     order_id: str
+    symbol: str
+    side: str
     filled_qty: float
     fill_price: float
     execution_timestamp: int = field(default_factory=lambda: int(time.time()))
@@ -63,6 +67,8 @@ class ExecutionResult:
         """Canonical JSON-serialisable representation."""
         return {
             "order_id": self.order_id,
+            "symbol": self.symbol,
+            "side": self.side,
             "filled_qty": self.filled_qty,
             "fill_price": self.fill_price,
             "execution_timestamp": self.execution_timestamp,
@@ -230,13 +236,23 @@ class QuantumExecutionVerifier:
 
         authorised_qty = trade_details.get("qty")
         authorised_price = trade_details.get("price")
+        authorised_symbol = trade_details.get("symbol")
+        authorised_side = trade_details.get("side")
         filled_qty = execution_result.get("filled_qty")
         fill_price = execution_result.get("fill_price")
+        fill_symbol = execution_result.get("symbol")
+        fill_side = execution_result.get("side")
 
         if authorised_qty is None or authorised_price is None:
             return False
         if filled_qty is None or fill_price is None:
             return False
+
+        if authorised_symbol is not None or authorised_side is not None:
+            if fill_symbol is None or fill_side is None:
+                return False
+            if fill_symbol != authorised_symbol or fill_side != authorised_side:
+                return False
 
         try:
             authorised_qty = float(authorised_qty)

@@ -462,6 +462,8 @@ def test_execution_attestation():
 
     er = ExecutionResult(
         order_id="exec_001",
+        symbol="BTC",
+        side="long",
         filled_qty=1,
         fill_price=50_000,
     )
@@ -499,7 +501,7 @@ def test_settlement_record():
         measurement_method=seed1.method,
     )
 
-    er = ExecutionResult(order_id="settle_001", filled_qty=1, fill_price=50000)
+    er = ExecutionResult(order_id="settle_001", symbol="BTC", side="long", filled_qty=1, fill_price=50000)
     snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
 
     att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
@@ -710,7 +712,7 @@ def test_verify_trade_flow_missing_commitment_is_not_quantum_safe(temp_audit_pat
         measurement_method=seed1.method,
     )
 
-    er = ExecutionResult(order_id=order_id, filled_qty=1, fill_price=50_000)
+    er = ExecutionResult(order_id=order_id, symbol="BTC", side="long", filled_qty=1, fill_price=50_000)
     snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
 
     att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
@@ -797,7 +799,7 @@ def test_verify_trade_flow_execution_terms_disconnected_from_commitment(
 
     # Executed fill is wildly disconnected from what was committed to:
     # 1000x the authorised quantity, 100x the authorised price.
-    er = ExecutionResult(order_id=order_id, filled_qty=10_000, fill_price=5_000)
+    er = ExecutionResult(order_id=order_id, symbol="BTC", side="long", filled_qty=10_000, fill_price=5_000)
     snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
 
     att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
@@ -842,6 +844,80 @@ def test_verify_trade_flow_execution_terms_disconnected_from_commitment(
     assert any("EXECUTION_TERMS_MISMATCH" in issue for issue in tamper["issues"])
 
 
+def test_verify_trade_flow_execution_symbol_side_substitution_rejected(
+    temp_audit_path,
+):
+    """
+    Round-6 finding (LOOP17-R6): commitment authorises BUY 10 AAPL @ $50,
+    but the execution phase -- validly signed, correctly chained, with
+    qty/price matching exactly -- reports a fill of SELL 10 TSLA @ $50.
+    Before the fix, ExecutionResult had no symbol/side fields at all and
+    verify_matches_commitment_terms never compared them, so this
+    substitution passed every check (qty/price within tolerance).
+
+    Arrange: build a commitment authorising symbol=AAPL/side=BUY/qty=10/
+    price=50, then an execution attestation with matching qty/price but
+    symbol=TSLA/side=SELL.
+    Act: run AuditVerifier.verify_trade_flow and the unit-level
+    verify_matches_commitment_terms check directly.
+    Assert: the substitution is caught -- execution_valid=False,
+    chain_valid=False, quantum_safe=False.
+    """
+    order_id = "symbol_side_substitution_001"
+    seed1 = get_seed()
+    seed2 = get_seed()
+    snap = AccountSnapshot.from_dict(ACCOUNT_STATE)
+
+    authorised_trade = {"symbol": "AAPL", "qty": 10, "side": "BUY", "price": 50}
+    c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+        order_id=order_id,
+        trade_details=authorised_trade,
+        account_state=snap,
+        quantum_seed=seed1.seed_int,
+        measurement_method=seed1.method,
+    )
+
+    # Qty and price exactly match the authorised terms, but the fill is
+    # for a completely different instrument and the opposite side.
+    er = ExecutionResult(
+        order_id=order_id, symbol="TSLA", side="SELL", filled_qty=10, fill_price=50
+    )
+    snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
+
+    att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+        commitment_sig=c_sig,
+        commitment_seed_hash=c_dict["quantum_seed_commitment"],
+        execution_result=er,
+        new_account_state=snap_after,
+        quantum_seed=seed2.seed_int,
+        measurement_method=seed2.method,
+    )
+
+    audit = AuditLog(temp_audit_path)
+    audit.append_commitment(c_dict, c_sig)
+    audit.append_execution(att_dict, att_sig)
+
+    registry = AccountKeyRegistry()
+    registry.register(order_id, c_sig["pubkey"])
+    registry.register(order_id, att_sig["pubkey"])
+
+    verifier = AuditVerifier()
+    result = verifier.verify_trade_flow(order_id, audit, registry=registry)
+
+    assert result["commitment_valid"] is True
+    assert result["execution_valid"] is False
+    assert result["chain_valid"] is False
+    assert result["quantum_safe"] is False
+
+    # The unit-level check itself must also directly reject the substitution.
+    assert (
+        QuantumExecutionVerifier.verify_matches_commitment_terms(
+            authorised_trade, er.to_json()
+        )
+        is False
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 18. AUDIT VERIFIER — SELF-REFERENTIAL SIGNATURE / MISSING IDENTITY BINDING
 #     REGRESSION (LOOP-17 round 3)
@@ -862,7 +938,7 @@ def _build_full_flow(order_id: str):
         measurement_method=seed1.method,
     )
 
-    er = ExecutionResult(order_id=order_id, filled_qty=1, fill_price=50_000)
+    er = ExecutionResult(order_id=order_id, symbol="BTC", side="long", filled_qty=1, fill_price=50_000)
     snap_after = AccountSnapshot.from_dict({**ACCOUNT_STATE, "nonce": 2})
 
     att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
