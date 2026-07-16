@@ -69,6 +69,42 @@ This public package is **CSPRNG-only**: all entropy comes from
 `secrets.token_bytes`. The quantum-hardware entropy variant is a separate,
 private project and ships no code here.
 
+## Security hardening & SOC 2 Type II readiness
+
+Protocol-C is not SOC 2 certified — no independent auditor has issued a
+report. What's here is an honest account of the engineering work done so
+far toward that posture, so anyone evaluating the library for a
+compliance-relevant use case can see exactly what's been checked and
+what's still open.
+
+**2026-07-15 hardening pass** (tracked in [PR #8](https://github.com/DBarr3/protocol-c/pull/8)):
+a multi-round audit → adversarial review → fix cycle, followed by standing
+red-team/blue-team sparring rounds against the hardened surface. Every
+fix carries a dedicated regression test (suite: 137 tests). Summary —
+full detail in [CHANGELOG.md](CHANGELOG.md#unreleased---2026-07-15):
+
+| Area | What was found and fixed |
+|---|---|
+| TSA verification | `verify()` wasn't checking the TSA's actual signed attestation — now parses and verifies the real CMS/TSTInfo structure. |
+| Network (SSRF) | Outbound TSA requests now require HTTPS and reject private/loopback/link-local/metadata-endpoint hosts. |
+| Timing side-channels | Modular inverse and scalar multiplication in the secp256k1 signer moved to fixed-shape/constant-iteration implementations. |
+| Key hygiene | `destroy()` now zeroes the private-key buffer in place. |
+| Business-logic integrity | Execution attestations are now cross-checked against the commitment's authorised trade terms; broker settlement acknowledgements are now cryptographically authenticated. |
+| Identity binding | New `AccountKeyRegistry` closes a gap where any self-signed key could pass every check with no proof of account ownership. |
+| Concurrency | Audit-log writes are now lock-guarded against a race that could silently overwrite a duplicate record. |
+| Availability | DoS bounds added on unbounded JSON/HTTP-response reads. |
+| Observability | Silent exception swallowing removed from the audit-rebuild and TSA request paths in favor of structured logging. |
+
+This addresses SOC 2 control areas most relevant to a signing/attestation
+library — **change integrity** (tamper detection, non-repudiation),
+**logical access** (identity binding on signers), and **availability**
+(DoS bounds, graceful failure) — but a hardening pass is not a
+certification. Still open before any real SOC 2 Type II claim: an
+independent third-party audit, formal control documentation, and
+continuous-monitoring evidence over the required observation period. If
+you're evaluating Protocol-C for a compliance-relevant deployment, treat
+this section as "here's what's been checked," not "this is certified."
+
 ## Cryptographic implementation notes
 
 - **Signer:** original pure-Python secp256k1 ECDSA in `ephemeral_signer.py`,
