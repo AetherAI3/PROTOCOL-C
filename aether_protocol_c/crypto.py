@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from .ephemeral_signer import EphemeralSigner
 
@@ -263,12 +266,10 @@ class QuantumEphemeralKey:
         Returns:
             True if the signature is valid.
         """
-        # EphemeralSigner.verify uses the pubkey from the signature envelope,
-        # not the private key, so we can use a temporary signer for verification.
-        temp = EphemeralSigner(quantum_seed=1)  # seed irrelevant for verify
-        result = temp.verify(message, signature)
-        temp.destroy()
-        return result
+        # Delegates to the module-level verify_signature() (which itself
+        # delegates to EphemeralSigner.verify_static()) so there is a single
+        # implementation of signature verification in this package.
+        return verify_signature(message, signature)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -303,11 +304,29 @@ def verify_signature(message: dict, signature: dict) -> bool:
         True if the signature is valid.
     """
     try:
-        temp = EphemeralSigner(quantum_seed=1)
-        result = temp.verify(message, signature)
-        temp.destroy()
-        return result
-    except Exception:
+        # verify_static() only parses the pubkey embedded in the signature
+        # envelope -- no private key is derived, unlike constructing a
+        # throwaway EphemeralSigner just to call its instance verify().
+        # This try/except is a deliberate second fail-closed layer, not
+        # pure duplication of verify_static's own -- it also catches
+        # unexpected failures at the call boundary itself (e.g. a caller
+        # substituting a broken verify_static implementation).
+        return EphemeralSigner.verify_static(message, signature)
+    except (KeyError, ValueError, TypeError) as exc:
+        # Malformed signature envelope (missing field, bad hex, wrong
+        # length, etc.) -- no key material is logged.
+        logger.debug(
+            "verify_signature() failed to parse signature envelope: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.debug(
+            "verify_signature() failed with unexpected error: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return False
 
 

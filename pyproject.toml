@@ -30,7 +30,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-timestamp = ["pyasn1>=0.5"]
+timestamp = ["pyasn1>=0.5", "pyasn1-modules>=0.4", "cryptography>=41"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

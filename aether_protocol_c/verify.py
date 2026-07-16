@@ -25,6 +25,7 @@ from .audit import AuditLog, PHASE_COMMITMENT, PHASE_EXECUTION, PHASE_SETTLEMENT
 from .commitment import QuantumCommitmentVerifier
 from .execution import QuantumExecutionVerifier
 from .crypto import verify_signature, SHOR_EARLIEST_ATTACK_SECONDS
+from .identity import AccountKeyRegistry
 from .settlement import QuantumSettlementVerifier, compute_flow_merkle
 
 
@@ -40,7 +41,13 @@ class AuditVerifier:
     independence, and chain linkage.
     """
 
-    def verify_trade_flow(self, order_id: str, audit_log: AuditLog) -> dict:
+    def verify_trade_flow(
+        self,
+        order_id: str,
+        audit_log: AuditLog,
+        registry: Optional[AccountKeyRegistry] = None,
+        account_id: Optional[str] = None,
+    ) -> dict:
         """
         Verify the complete trade flow for an order.
 
@@ -50,16 +57,53 @@ class AuditVerifier:
         3. All temporal windows prove safety against Shor's
         4. All seeds are independent (P4: PFS)
         5. Chain linkage is correct
+        6. Every phase's embedded pubkey is a registered, authorised
+           signer for the account (identity binding)
+
+        A valid ECDSA signature over an envelope only proves that
+        *some* key -- possibly one an attacker just generated -- signed
+        that envelope; it does not by itself prove the account holder
+        authorised the trade.  ``registry`` supplies the out-of-band
+        ground truth (registered at account onboarding, never derived
+        from the audit log itself) needed to close that gap.  Every
+        phase is required to pass identity binding for the flow to be
+        reported quantum_safe/chain_valid -- if ``registry`` is not
+        supplied, the flow fails closed (identity_bound=False,
+        quantum_safe=False), because there is no way to prove any
+        signature actually belongs to the account holder.
 
         Args:
             order_id: The order to verify.
             audit_log: The audit log to read from.
+            registry: Out-of-band registry of authorised account
+                pubkeys. Required for the flow to be certified
+                quantum_safe/chain_valid.
+            account_id: Identity scope to check pubkeys against.
+                Defaults to ``order_id`` when omitted (this codebase
+                has no separate account identifier today; callers with
+                a real account/order distinction should pass it
+                explicitly).
 
         Returns:
             Comprehensive verification result dict.
         """
         flow = audit_log.get_trade_flow(order_id)
         details: List[str] = []
+        scope = account_id or order_id
+
+        def _identity_ok(signature: Optional[dict]) -> bool:
+            if registry is None:
+                return False
+            if not signature:
+                return False
+            pubkey_hex = signature.get("pubkey", "")
+            return registry.is_authorized(scope, pubkey_hex)
+
+        if registry is None:
+            details.append(
+                "Identity registry: NOT PROVIDED -- no phase can be certified "
+                "as authorised by the account holder (fail closed)"
+            )
 
         # ── Commitment verification ──────────────────────────────────
         commitment_valid: Optional[bool] = None
@@ -70,13 +114,17 @@ class AuditVerifier:
             state_ok = QuantumCommitmentVerifier.verify_state_binding(flow["commitment"])
             quantum_ok = QuantumCommitmentVerifier.verify_quantum_binding(flow["commitment"])
             temporal_ok = QuantumCommitmentVerifier.verify_temporal_safety(flow["commitment"])
+            identity_ok = _identity_ok(flow["commitment_sig"])
 
-            commitment_valid = sig_ok and state_ok and quantum_ok and temporal_ok
+            commitment_valid = (
+                sig_ok and state_ok and quantum_ok and temporal_ok and identity_ok
+            )
 
             details.append(f"Commitment signature valid: {sig_ok}")
             details.append(f"Commitment state binding: {state_ok}")
             details.append(f"Commitment quantum binding: {quantum_ok}")
             details.append(f"Commitment temporal safety: {temporal_ok}")
+            details.append(f"Commitment identity bound (authorised signer): {identity_ok}")
         else:
             details.append("Commitment phase: MISSING")
 
@@ -88,12 +136,14 @@ class AuditVerifier:
             )
             quantum_ok = QuantumExecutionVerifier.verify_quantum_binding(flow["execution"])
             temporal_ok = QuantumExecutionVerifier.verify_temporal_safety(flow["execution"])
+            identity_ok = _identity_ok(flow["execution_sig"])
 
-            execution_valid = sig_ok and quantum_ok and temporal_ok
+            execution_valid = sig_ok and quantum_ok and temporal_ok and identity_ok
 
             details.append(f"Execution signature valid: {sig_ok}")
             details.append(f"Execution quantum binding: {quantum_ok}")
             details.append(f"Execution temporal safety: {temporal_ok}")
+            details.append(f"Execution identity bound (authorised signer): {identity_ok}")
 
             # Check commitment reference
             if flow["commitment_sig"] is not None:
@@ -124,6 +174,19 @@ class AuditVerifier:
                 details.append(f"Seeds independent (commitment vs execution): {seeds_independent}")
                 if not seeds_independent:
                     execution_valid = False
+
+            # Check the executed fill terms actually match what was
+            # authorised in the commitment (qty/price bounds) -- chain
+            # linkage alone does not prove economic-term correspondence.
+            if flow["commitment"] is not None:
+                trade_details = flow["commitment"].get("trade_details", {})
+                execution_result = flow["execution"].get("execution_result", {})
+                terms_ok = QuantumExecutionVerifier.verify_matches_commitment_terms(
+                    trade_details, execution_result
+                )
+                details.append(f"Execution matches authorised trade terms: {terms_ok}")
+                if not terms_ok:
+                    execution_valid = False
         else:
             details.append("Execution phase: MISSING")
 
@@ -133,9 +196,29 @@ class AuditVerifier:
             sig_ok = QuantumSettlementVerifier.verify_signature(
                 flow["settlement"], flow["settlement_sig"]
             )
+            identity_ok = _identity_ok(flow["settlement_sig"])
             details.append(f"Settlement signature valid: {sig_ok}")
+            details.append(f"Settlement identity bound (authorised signer): {identity_ok}")
 
-            settlement_valid = sig_ok
+            # Broker identity binding: broker_settlement_sig is a
+            # free-form acknowledgement string that, by itself, proves
+            # nothing about who produced it. It must be accompanied by
+            # a broker_signature envelope that (a) is a valid signature
+            # over the broker attestation (checked inside verify_chain
+            # below) and (b) is signed by a pubkey registered, out-of-
+            # band, as an authorised broker for this scope -- otherwise
+            # a compromised settlement-phase key could fabricate any
+            # broker acknowledgement and still pass every other check.
+            broker_signature = flow["settlement"].get("broker_signature")
+            broker_pubkey = (broker_signature or {}).get("pubkey", "")
+            broker_identity_ok = registry is not None and registry.is_broker_authorized(
+                scope, broker_pubkey
+            )
+            details.append(
+                f"Broker signature authenticated (registered broker key): {broker_identity_ok}"
+            )
+
+            settlement_valid = sig_ok and identity_ok and broker_identity_ok
 
             # Chain linkage
             if flow["commitment_sig"] is not None and flow["execution_sig"] is not None:
@@ -165,13 +248,19 @@ class AuditVerifier:
             details.append("Settlement phase: MISSING")
 
         # ── Overall assessment ───────────────────────────────────────
-        chain_valid = all(
-            v is True
-            for v in [commitment_valid, execution_valid, settlement_valid]
-            if v is not None
-        )
+        # All three phases (commitment, execution, settlement) must be
+        # PRESENT and individually valid. A missing phase yields None for
+        # that phase's *_valid, which must never be silently filtered out
+        # of the aggregate check -- otherwise a flow missing e.g. the
+        # commitment record could still be certified chain_valid/quantum_safe
+        # as long as the phases that do exist are self-consistent.
+        phase_results = [commitment_valid, execution_valid, settlement_valid]
+        chain_valid = all(v is True for v in phase_results)
 
         # Quantum safety summary
+        # A flow with zero recorded phases has no cryptographic evidence at
+        # all, so it must never be reported as quantum-safe (vacuous truth
+        # over an empty all() would otherwise make chain_valid=True here).
         quantum_safe = chain_valid  # If all checks pass, the flow is quantum-safe
 
         return {
@@ -181,10 +270,17 @@ class AuditVerifier:
             "commitment_valid": commitment_valid,
             "execution_valid": execution_valid,
             "settlement_valid": settlement_valid,
+            "identity_bound": registry is not None,
             "details": details,
         }
 
-    def detect_tampering(self, order_id: str, audit_log: AuditLog) -> dict:
+    def detect_tampering(
+        self,
+        order_id: str,
+        audit_log: AuditLog,
+        registry: Optional[AccountKeyRegistry] = None,
+        account_id: Optional[str] = None,
+    ) -> dict:
         """
         Detect tampering in a trade flow.
 
@@ -193,12 +289,34 @@ class AuditVerifier:
         Args:
             order_id: The order to check.
             audit_log: The audit log to read from.
+            registry: Out-of-band registry of authorised account
+                pubkeys. Without it, an attacker-fabricated flow signed
+                with a fresh, self-consistent keypair reports as
+                untampered -- so its absence is itself flagged as an
+                issue.
+            account_id: Identity scope to check pubkeys against.
+                Defaults to ``order_id`` when omitted.
 
         Returns:
             Dict with order_id, tampered (bool), issues (list of strings).
         """
         flow = audit_log.get_trade_flow(order_id)
         issues: List[str] = []
+        scope = account_id or order_id
+
+        def _check_identity(signature: Optional[dict], label: str) -> None:
+            if registry is None:
+                issues.append(
+                    f"{label}_IDENTITY_UNVERIFIED: No identity registry supplied -- "
+                    "cannot confirm the signing key belongs to the account holder"
+                )
+                return
+            pubkey_hex = (signature or {}).get("pubkey", "")
+            if not registry.is_authorized(scope, pubkey_hex):
+                issues.append(
+                    f"{label}_UNAUTHORIZED_KEY: Signing pubkey is not a registered "
+                    f"authorised signer for {scope!r}"
+                )
 
         # Check commitment
         if flow["commitment"] is not None and flow["commitment_sig"] is not None:
@@ -216,6 +334,7 @@ class AuditVerifier:
                 issues.append(
                     "COMMITMENT_TEMPORAL_UNSAFE: Key may not expire before Shor's window"
                 )
+            _check_identity(flow["commitment_sig"], "COMMITMENT")
 
         # Check execution
         if flow["execution"] is not None and flow["execution_sig"] is not None:
@@ -252,6 +371,16 @@ class AuditVerifier:
                     issues.append(
                         "SEED_REUSE: Commitment and execution used the same quantum seed"
                     )
+                trade_details = flow["commitment"].get("trade_details", {})
+                execution_result = flow["execution"].get("execution_result", {})
+                if not QuantumExecutionVerifier.verify_matches_commitment_terms(
+                    trade_details, execution_result
+                ):
+                    issues.append(
+                        "EXECUTION_TERMS_MISMATCH: Filled qty/price does not match "
+                        "the authorised commitment's trade_details"
+                    )
+            _check_identity(flow["execution_sig"], "EXECUTION")
 
         # Check settlement
         if flow["settlement"] is not None and flow["settlement_sig"] is not None:
@@ -279,6 +408,21 @@ class AuditVerifier:
             ):
                 issues.append(
                     "TEMPORAL_WINDOW_UNSAFE: Not all keys expire before Shor's"
+                )
+            _check_identity(flow["settlement_sig"], "SETTLEMENT")
+
+            broker_signature = flow["settlement"].get("broker_signature")
+            broker_pubkey = (broker_signature or {}).get("pubkey", "")
+            if registry is None:
+                issues.append(
+                    "BROKER_IDENTITY_UNVERIFIED: No identity registry supplied -- "
+                    "cannot confirm the broker acknowledgement's signing key is a "
+                    "registered broker"
+                )
+            elif not registry.is_broker_authorized(scope, broker_pubkey):
+                issues.append(
+                    "BROKER_UNAUTHORIZED_KEY: broker_settlement_sig's signing key "
+                    "is not a registered authorised broker for this scope"
                 )
 
         return {

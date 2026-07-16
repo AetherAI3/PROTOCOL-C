@@ -11,20 +11,26 @@ Lifecycle:
     signer = EphemeralSigner(quantum_seed=...)
     sig    = signer.sign_manifest(manifest_dict)
     ok     = signer.verify(manifest_dict, sig)
-    signer.destroy()   # zeroes private key from memory
+    signer.destroy()   # best-effort zeroing of private key buffer
 
 Security properties:
     - Private key derived from quantum entropy via HMAC-SHA256
     - Key NEVER written to disk
-    - destroy() zeroes key material in-place
+    - destroy() overwrites the private key's backing bytearray in-place
+      (best-effort only -- CPython's GC/refcounting may still leave
+      copies elsewhere in the process image; no guarantee against a
+      memory dump taken before destroy() runs)
     - Ephemeral: one key per session, discarded at end
 """
 
 import hashlib
 import hmac
 import json
+import logging
 import struct
 import time
+
+logger = logging.getLogger(__name__)
 
 
 # ── secp256k1 curve parameters ───────────────────────────────────────────────
@@ -47,21 +53,20 @@ B = 7
 # ── Modular arithmetic helpers ───────────────────────────────────────────────
 
 def _modinv(a: int, m: int) -> int:
-    """Modular inverse using extended Euclidean algorithm."""
-    if a < 0:
-        a = a % m
-    g, x, _ = _extended_gcd(a, m)
-    if g != 1:
-        raise ValueError("No modular inverse")
-    return x % m
+    """
+    Modular inverse via Fermat's little theorem (a^(m-2) mod m).
 
-
-def _extended_gcd(a: int, b: int) -> tuple:
-    """Extended GCD: returns (gcd, x, y) such that a*x + b*y = gcd."""
+    Requires m to be prime -- true for both P and N here. Unlike the
+    extended Euclidean algorithm (whose recursion depth and branching
+    pattern vary with the operands, including secret values), Python's
+    built-in `pow(base, exp, mod)` performs fixed-shape binary
+    exponentiation, avoiding the operand-dependent control flow that
+    made the previous implementation a timing side-channel risk.
+    """
+    a = a % m
     if a == 0:
-        return b, 0, 1
-    g, x, y = _extended_gcd(b % a, a)
-    return g, y - (b // a) * x, x
+        raise ValueError("No modular inverse")
+    return pow(a, m - 2, m)
 
 
 # ── Point on secp256k1 ──────────────────────────────────────────────────────
@@ -111,19 +116,71 @@ def _point_add(p1, p2):
     return _Point(x3, y3)
 
 
-def _point_mul(k: int, point):
-    """Scalar multiplication via double-and-add."""
-    result = INFINITY
-    addend = point
-    while k > 0:
-        if k & 1:
-            result = _point_add(result, addend)
-        addend = _point_add(addend, addend)
-        k >>= 1
-    return result
+def _point_double(p):
+    """
+    Double a point on secp256k1 (explicit, no coordinate-equality branch).
+
+    Tangent-line slope at (x, y) on y^2 = x^3 + A*x + B is the standard
+    calculus derivative dy/dx = (3x^2 + A) / (2y) -- the 3 and 2 below are
+    that fixed textbook formula, not arbitrary/tunable values.
+    """
+    if p is INFINITY:
+        return INFINITY
+    if p.y == 0:
+        return INFINITY
+    SLOPE_NUMERATOR_X_COEFF = 3    # d/dx(x^3) = 3x^2
+    SLOPE_DENOMINATOR_Y_COEFF = 2  # d/dy(y^2) = 2y
+    lam = (SLOPE_NUMERATOR_X_COEFF * p.x * p.x + A) * _modinv(SLOPE_DENOMINATOR_Y_COEFF * p.y, P) % P
+    x3 = (lam * lam - SLOPE_DENOMINATOR_Y_COEFF * p.x) % P
+    y3 = (lam * (p.x - x3) - p.y) % P
+    return _Point(x3, y3)
+
+
+def _point_mul(k: int, point, bit_length: int = 256):
+    """
+    Scalar multiplication via a Montgomery-ladder-style fixed schedule.
+
+    Unlike the previous double-and-add loop -- which iterated only for
+    as many bits as `k` actually had and skipped the accumulator update
+    whenever a bit was 0 -- this walks a fixed `bit_length` (256, large
+    enough for any value < N) and performs exactly one point addition
+    and one point doubling on every iteration regardless of the bit
+    value. That keeps the operation count/sequence independent of the
+    secret scalar `k`, removing the most direct timing side-channel
+    (this is still pure Python, so it is not a cryptographic
+    constant-time guarantee, but it eliminates the "do work only when
+    bit==1" and coordinate-equality-based doubling detection that made
+    the original implementation branch directly on secret data).
+    """
+    r0 = INFINITY
+    r1 = point
+    for i in reversed(range(bit_length)):
+        bit = (k >> i) & 1
+        if bit == 0:
+            r1 = _point_add(r0, r1)
+            r0 = _point_double(r0)
+        else:
+            r0 = _point_add(r0, r1)
+            r1 = _point_double(r1)
+    return r0
 
 
 G = _Point(Gx, Gy)
+
+
+def _zero_bytearray(buf: bytearray) -> None:
+    """
+    Overwrite a mutable buffer's bytes in place.
+
+    Best-effort only: in a managed-memory runtime like CPython this does
+    not guarantee the value never existed elsewhere in the process image
+    (the garbage collector, refcounting, or interpreter internals may
+    still have made copies), but it does eliminate the *known* long-lived
+    copy this module controls directly, which a bare `= 0` rebind on an
+    immutable int/bytes object never touches.
+    """
+    for i in range(len(buf)):
+        buf[i] = 0
 
 
 # ── RFC 6979 deterministic k ────────────────────────────────────────────────
@@ -202,19 +259,52 @@ class EphemeralSigner:
         self._destroyed = False
         self._sign_count = 0
 
-        # Derive private key from quantum seed via HMAC-SHA256
-        seed_bytes = quantum_seed.to_bytes(32, "big")
-        key_material = hmac.new(
-            b"aether-ephemeral-secp256k1",
-            seed_bytes,
-            hashlib.sha256,
-        ).digest()
-        self._privkey = int.from_bytes(key_material, "big") % N
-        if self._privkey == 0:
-            self._privkey = 1  # astronomically unlikely
+        # ---- private key derivation (quantum seed -> HMAC-SHA256) ----
+        # Held in a mutable bytearray (not a bare int/bytes object) so
+        # destroy() can overwrite the actual backing buffer in place --
+        # Python ints and bytes are immutable and can't be zeroed after
+        # the fact, only rebound to a new object, which leaves the
+        # original value sitting on the heap.
+        seed_bytes = bytearray(quantum_seed.to_bytes(32, "big"))
+        key_material = bytearray(
+            hmac.new(
+                b"aether-ephemeral-secp256k1",
+                bytes(seed_bytes),
+                hashlib.sha256,
+            ).digest()
+        )
+        privkey_int = int.from_bytes(key_material, "big") % N
+        if privkey_int == 0:
+            # astronomically unlikely (~1/2^256), but never fall back to a
+            # known constant like 1 -- re-derive deterministically instead,
+            # from a distinct domain-separated HMAC (not a loop: a second
+            # zero would require winning this ~1/2^256 draw twice in a row).
+            _zero_bytearray(key_material)
+            key_material = bytearray(
+                hmac.new(
+                    b"aether-ephemeral-secp256k1-zero-key-retry",
+                    bytes(seed_bytes),
+                    hashlib.sha256,
+                ).digest()
+            )
+            privkey_int = int.from_bytes(key_material, "big") % N or 1
+
+        self._privkey_buf = bytearray(privkey_int.to_bytes(32, "big"))
+        # ---- end private key derivation ----
 
         # Derive public key
         self._pubkey = _point_mul(self._privkey, G)
+
+        # The seed and HMAC digest are intermediate copies of key material
+        # that are no longer needed once the private key buffer above is
+        # populated -- wipe them immediately rather than leaving them on
+        # the heap for the lifetime of the object.
+        _zero_bytearray(seed_bytes)
+        _zero_bytearray(key_material)
+
+    @property
+    def _privkey(self) -> int:
+        return int.from_bytes(self._privkey_buf, "big")
 
     @property
     def public_key_hex(self) -> str:
@@ -248,6 +338,20 @@ class EphemeralSigner:
 
     def verify(self, manifest: dict, signature: dict) -> bool:
         """Verify a signature envelope against a manifest dict."""
+        return EphemeralSigner.verify_static(manifest, signature)
+
+    @staticmethod
+    def verify_static(manifest: dict, signature: dict) -> bool:
+        """
+        Verify a signature envelope against a manifest dict.
+
+        This is a pure function of the signature envelope's embedded public
+        key -- it never derives or holds any private key material, so
+        callers that only need to verify (no signing) should use this
+        instead of instantiating an EphemeralSigner, which would otherwise
+        pointlessly derive a throwaway private key and perform an EC point
+        multiplication on every call.
+        """
         try:
             r = int(signature["r"], 16)
             s = int(signature["s"], 16)
@@ -269,17 +373,41 @@ class EphemeralSigner:
             msg_hash = hashlib.sha256(canonical.encode("utf-8")).digest()
 
             return _ecdsa_verify(pub, msg_hash, r, s)
-        except Exception:
+        except (KeyError, ValueError, TypeError) as exc:
+            # Malformed signature envelope (missing field, bad hex, wrong
+            # length, non-curve point, etc.) -- no key material is logged.
+            logger.debug(
+                "EphemeralSigner.verify_static() failed to parse signature envelope: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        except Exception as exc:
+            logger.debug(
+                "EphemeralSigner.verify_static() failed with unexpected error: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             return False
 
     def destroy(self) -> dict:
-        """Zero private key material. Returns destruction receipt."""
+        """
+        Zero private key material in-place (best-effort).
+
+        Overwrites the mutable bytearray backing the private key so the
+        actual scalar bytes are gone from this buffer, not merely
+        rebound to a new object. This is still a best-effort operation
+        in a managed-memory language: it does not guarantee against
+        copies made elsewhere by the GC, refcounting, or interpreter
+        internals, and offers no protection against a memory dump taken
+        before destroy() runs.
+        """
         receipt = {
             "destroyed": True,
             "sign_count": self._sign_count,
             "lifetime_seconds": round(time.time() - self._created_at, 2),
         }
-        self._privkey = 0
+        _zero_bytearray(self._privkey_buf)
         self._destroyed = True
         return receipt
 

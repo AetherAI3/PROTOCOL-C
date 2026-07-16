@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,15 +94,40 @@ class AuditEntry:
 
     @staticmethod
     def from_dict(d: dict) -> "AuditEntry":
-        """Reconstruct from dict."""
-        return AuditEntry(
-            timestamp=d["timestamp"],
-            phase=d["phase"],
-            order_id=d["order_id"],
-            data=d["data"],
-            signature=d["signature"],
-            quantum_proof=d["quantum_proof"],
-        )
+        """Reconstruct from dict.
+
+        Raises:
+            AuditError: if required keys are missing or the `data`,
+                `signature`, or `quantum_proof` fields are not dicts.
+                This keeps malformed/tampered JSONL lines from silently
+                propagating non-dict values into downstream verification
+                code, which would otherwise crash with an unhandled
+                AttributeError instead of a clean tamper report.
+        """
+        try:
+            data = d["data"]
+            signature = d["signature"]
+            quantum_proof = d["quantum_proof"]
+            entry = AuditEntry(
+                timestamp=d["timestamp"],
+                phase=d["phase"],
+                order_id=d["order_id"],
+                data=data,
+                signature=signature,
+                quantum_proof=quantum_proof,
+            )
+        except KeyError as exc:
+            raise AuditError(f"Malformed audit entry: missing key {exc}") from exc
+
+        for field_name in ("data", "signature", "quantum_proof"):
+            value = getattr(entry, field_name)
+            if not isinstance(value, dict):
+                raise AuditError(
+                    f"Malformed audit entry: field '{field_name}' must be a "
+                    f"dict, got {type(value).__name__}"
+                )
+
+        return entry
 
 
 def _extract_quantum_proof(data: dict) -> dict:
@@ -176,6 +202,12 @@ class AuditLog:
 
         # Set before _init_db so close()/__del__ are safe even if init fails.
         self._conn = None
+
+        # Guards the append/rotate critical section (JSONL write + SQLite
+        # index write + _line_count read-modify-write) so concurrent
+        # threads sharing one AuditLog (check_same_thread=False signals
+        # this is expected) cannot race on the same line number / offset.
+        self._append_lock = threading.RLock()
 
         # Initialise SQLite index
         self._init_db()
@@ -274,9 +306,12 @@ class AuditLog:
                     entry = AuditEntry.from_dict(data)
                     self._index_entry(entry, offset, line_num)
                     line_num += 1
-                except (json.JSONDecodeError, KeyError):
-                    line_num += 1
-                    continue
+                except (json.JSONDecodeError, KeyError) as exc:
+                    self._conn.commit()
+                    raise AuditError(
+                        f"Corrupt audit log entry at line {line_num} "
+                        f"while rebuilding index: {exc}"
+                    ) from exc
         self._conn.commit()
 
     def _index_entry(
@@ -387,24 +422,28 @@ class AuditLog:
         Writes to the JSONL file (binary mode for reliable byte offsets)
         and indexes the entry in SQLite.
         """
-        # Check rotation before writing (but not for rotation entries
-        # themselves, to avoid infinite recursion)
-        if entry.phase != "LOG_ROTATION":
-            self._maybe_rotate()
+        # Serialize the whole read-modify-write critical section: rotation
+        # check, JSONL append, SQLite index write, and _line_count bump
+        # must be atomic w.r.t. other threads sharing this AuditLog.
+        with self._append_lock:
+            # Check rotation before writing (but not for rotation entries
+            # themselves, to avoid infinite recursion)
+            if entry.phase != "LOG_ROTATION":
+                self._maybe_rotate()
 
-        line = json.dumps(
-            entry.to_json(), sort_keys=True, separators=(",", ":")
-        )
+            line = json.dumps(
+                entry.to_json(), sort_keys=True, separators=(",", ":")
+            )
 
-        # Write to JSONL in binary mode for reliable byte offsets
-        with open(self._path, "ab") as f:
-            offset = f.tell()
-            f.write((line + "\n").encode("utf-8"))
+            # Write to JSONL in binary mode for reliable byte offsets
+            with open(self._path, "ab") as f:
+                offset = f.tell()
+                f.write((line + "\n").encode("utf-8"))
 
-        # Index in SQLite
-        self._index_entry(entry, offset, self._line_count)
-        self._conn.commit()
-        self._line_count += 1
+            # Index in SQLite
+            self._index_entry(entry, offset, self._line_count)
+            self._conn.commit()
+            self._line_count += 1
 
     def append_commitment(
         self, commitment: dict, signature: dict
@@ -526,8 +565,6 @@ class AuditLog:
         Returns:
             Dict with data and signature for each phase.
         """
-        entries = self.read_by_order_id(order_id)
-
         flow: Dict[str, Any] = {
             "order_id": order_id,
             "commitment": None,
@@ -541,19 +578,44 @@ class AuditLog:
             "settlement_quantum_proof": None,
         }
 
-        for entry in entries:
-            if entry.phase == PHASE_COMMITMENT:
-                flow["commitment"] = entry.data
-                flow["commitment_sig"] = entry.signature
-                flow["commitment_quantum_proof"] = entry.quantum_proof
-            elif entry.phase == PHASE_EXECUTION:
-                flow["execution"] = entry.data
-                flow["execution_sig"] = entry.signature
-                flow["execution_quantum_proof"] = entry.quantum_proof
-            elif entry.phase == PHASE_SETTLEMENT:
-                flow["settlement"] = entry.data
-                flow["settlement_sig"] = entry.signature
-                flow["settlement_quantum_proof"] = entry.quantum_proof
+        phase_to_keys = {
+            PHASE_COMMITMENT: ("commitment", "commitment_sig", "commitment_quantum_proof"),
+            PHASE_EXECUTION: ("execution", "execution_sig", "execution_quantum_proof"),
+            PHASE_SETTLEMENT: ("settlement", "settlement_sig", "settlement_quantum_proof"),
+        }
+        keys_by_record_id = {
+            f"{order_id}_{phase}": keys for phase, keys in phase_to_keys.items()
+        }
+
+        # Single indexed query + single file open for all three phases,
+        # instead of three separate get_by_id() round-trips -- still O(1)
+        # indexed lookups (no full-file scan), just batched.
+        placeholders = ",".join("?" * len(keys_by_record_id))
+        cur = self._conn.execute(
+            f"SELECT record_id, jsonl_offset FROM audit_index WHERE record_id IN ({placeholders})",
+            list(keys_by_record_id),
+        )
+        offsets_by_record_id = {row[0]: row[1] for row in cur.fetchall()}
+
+        if offsets_by_record_id:
+            with open(self._path, "rb") as f:
+                for record_id, offset in offsets_by_record_id.items():
+                    data_key, sig_key, proof_key = keys_by_record_id[record_id]
+                    f.seek(offset)
+                    raw = f.readline()
+                    if not raw:
+                        continue
+                    try:
+                        record = json.loads(raw.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    try:
+                        entry = AuditEntry.from_dict(record)
+                    except (KeyError, TypeError) as exc:
+                        raise AuditError(f"Corrupt audit log entry: {exc}") from exc
+                    flow[data_key] = entry.data
+                    flow[sig_key] = entry.signature
+                    flow[proof_key] = entry.quantum_proof
 
         return flow
 

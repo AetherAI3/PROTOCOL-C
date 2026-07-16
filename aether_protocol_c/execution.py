@@ -47,6 +47,8 @@ class ExecutionResult:
 
     Fields:
         order_id: The order that was executed.
+        symbol: The instrument that was actually filled.
+        side: The actual fill direction ("BUY"/"SELL", etc.).
         filled_qty: Quantity actually filled.
         fill_price: Price at which the fill occurred.
         execution_timestamp: Unix timestamp of execution.
@@ -54,6 +56,8 @@ class ExecutionResult:
     """
 
     order_id: str
+    symbol: str
+    side: str
     filled_qty: float
     fill_price: float
     execution_timestamp: int = field(default_factory=lambda: int(time.time()))
@@ -63,6 +67,8 @@ class ExecutionResult:
         """Canonical JSON-serialisable representation."""
         return {
             "order_id": self.order_id,
+            "symbol": self.symbol,
+            "side": self.side,
             "filled_qty": self.filled_qty,
             "fill_price": self.fill_price,
             "execution_timestamp": self.execution_timestamp,
@@ -189,6 +195,95 @@ class QuantumExecutionVerifier:
     def verify_references_commitment(attestation: dict, commitment_sig: dict) -> bool:
         """Verify the attestation references the correct commitment."""
         return attestation.get("commitment_sig") == commitment_sig
+
+    @staticmethod
+    def verify_matches_commitment_terms(
+        trade_details: dict,
+        execution_result: dict,
+        price_tolerance: float = 0.02,
+    ) -> bool:
+        """
+        Verify the execution's actual fill terms correspond to what the
+        commitment authorised.
+
+        A valid ``commitment_sig`` reference (dict-equality of the
+        signature envelope, see ``verify_references_commitment``) only
+        proves the execution phase points at the right commitment
+        record -- it says nothing about whether the economic terms that
+        were actually filled (quantity, price) stay within what
+        ``trade_details`` authorised. Without this check, a validly
+        signed execution attestation could report an arbitrarily larger
+        filled_qty and/or wildly different fill_price than what was
+        committed to, and every other check (signature, quantum
+        binding, nonce, seed independence, chain linkage) would still
+        pass.
+
+        Args:
+            trade_details: The commitment's authorised trade terms
+                (expects "qty", "price", "symbol", and "side" keys).
+                "symbol"/"side" are mandatory here: a commitment that
+                omits them authorises nothing and must fail closed
+                rather than being treated as "any symbol/side allowed".
+            execution_result: The execution's ``execution_result`` dict
+                (expects "filled_qty", "fill_price", "symbol", and
+                "side" keys).
+            price_tolerance: Maximum allowed fractional deviation of
+                fill_price from the authorised price (default 2%).
+
+        Returns:
+            True if filled_qty does not exceed the authorised qty,
+            fill_price is within tolerance of the authorised price,
+            and fill_symbol/fill_side exactly match the authorised
+            symbol/side. False if required fields are missing (on
+            either side) or any term diverges.
+        """
+        if not isinstance(trade_details, dict) or not isinstance(execution_result, dict):
+            return False
+
+        authorised_qty = trade_details.get("qty")
+        authorised_price = trade_details.get("price")
+        authorised_symbol = trade_details.get("symbol")
+        authorised_side = trade_details.get("side")
+        filled_qty = execution_result.get("filled_qty")
+        fill_price = execution_result.get("fill_price")
+        fill_symbol = execution_result.get("symbol")
+        fill_side = execution_result.get("side")
+
+        if authorised_qty is None or authorised_price is None:
+            return False
+        if filled_qty is None or fill_price is None:
+            return False
+
+        # Symbol/side must always be authorised and must always match the
+        # fill. trade_details is a free-form dict supplied at commitment
+        # creation time and may simply omit "symbol"/"side" -- that must
+        # NOT be treated as "no constraint"; it must fail closed, since
+        # execution_result always carries a concrete symbol/side and an
+        # omitted authorisation is not evidence that any symbol/side was
+        # sanctioned.
+        if authorised_symbol is None or authorised_side is None:
+            return False
+        if fill_symbol is None or fill_side is None:
+            return False
+        if fill_symbol != authorised_symbol or fill_side != authorised_side:
+            return False
+
+        try:
+            authorised_qty = float(authorised_qty)
+            authorised_price = float(authorised_price)
+            filled_qty = float(filled_qty)
+            fill_price = float(fill_price)
+        except (TypeError, ValueError):
+            return False
+
+        if filled_qty < 0 or filled_qty > authorised_qty:
+            return False
+
+        if authorised_price == 0:
+            return fill_price == 0
+
+        deviation = abs(fill_price - authorised_price) / abs(authorised_price)
+        return deviation <= price_tolerance
 
     @staticmethod
     def verify_nonce_increment(commitment_nonce: int, attestation: dict) -> bool:

@@ -39,16 +39,44 @@ DEFAULT_CONFIG = {
     "audit_log": "audit/audit.jsonl",
 }
 
+# Maximum number of bytes accepted for a single JSON input (file or stdin).
+# Guards against unbounded-memory DoS from a runaway pipe or malicious input.
+MAX_JSON_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB
+
 
 # ── IO helpers ────────────────────────────────────────────────────────────────
+
+def _read_limited(fh, max_bytes: int) -> str:
+    """Read at most `max_bytes` (+1 chunk) from a text file-like object.
+
+    Raises ValueError if the stream contains more than `max_bytes` of data,
+    instead of buffering an unbounded amount of input into memory.
+    """
+    chunks: list[str] = []
+    total = 0
+    # Read in bounded chunks rather than fh.read() so we never buffer more
+    # than max_bytes + one chunk's worth of attacker-controlled data.
+    chunk_size = 65536
+    while total <= max_bytes:
+        chunk = fh.read(chunk_size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > max_bytes:
+        raise ValueError(
+            f"JSON input exceeds maximum allowed size of {max_bytes} bytes"
+        )
+    return "".join(chunks)
+
 
 def _read_json(path: str | None) -> Any:
     """Read JSON from a file path, or from stdin when path is None or '-'."""
     if path in (None, "-"):
-        raw = sys.stdin.read()
+        raw = _read_limited(sys.stdin, MAX_JSON_INPUT_BYTES)
     else:
         with open(path, "r", encoding="utf-8") as fh:
-            raw = fh.read()
+            raw = _read_limited(fh, MAX_JSON_INPUT_BYTES)
     if not raw.strip():
         raise ValueError("no JSON input provided")
     return json.loads(raw)
