@@ -200,6 +200,8 @@ Each phase lands in the audit log under `DECISION_COMMITMENT`, `EXECUTION_ATTEST
 
 See [SECURITY.md](SECURITY.md) for the full threat model, assumptions, and how to report a vulnerability. The full technical white paper — the CVE-2025-59536 problem, the design, and honest scope — is in [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md).
 
+**Security hardening.** Protocol-C went through a multi-round audit → adversarial-review → fix cycle plus standing red-team/blue-team sparring in July 2026 — TSA verification, SSRF, signer timing side-channels, key hygiene, execution/settlement integrity, identity binding, and audit-log concurrency. Not SOC 2 certified — see [SECURITY.md#security-hardening--soc-2-type-ii-readiness](SECURITY.md#security-hardening--soc-2-type-ii-readiness) for exactly what's covered and what isn't.
+
 ## Honest about "quantum-safe"
 
 Read this part. "Quantum-safe" here is a **temporal** argument, **not** post-quantum cryptography:
