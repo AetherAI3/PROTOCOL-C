@@ -37,11 +37,11 @@ dev = ["pytest>=8.0"]
 aether-protocol-c = "aether_protocol_c.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/DBarr3/protocol-c"
-Repository = "https://github.com/DBarr3/protocol-c"
-Issues = "https://github.com/DBarr3/protocol-c/issues"
-Documentation = "https://github.com/DBarr3/protocol-c/blob/main/docs/how-it-works.md"
-Changelog = "https://github.com/DBarr3/protocol-c/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/AetherAI3/PROTOCOL-C"
+Repository = "https://github.com/AetherAI3/PROTOCOL-C"
+Issues = "https://github.com/AetherAI3/PROTOCOL-C/issues"
+Documentation = "https://github.com/AetherAI3/PROTOCOL-C/blob/main/docs/how-it-works.md"
+Changelog = "https://github.com/AetherAI3/PROTOCOL-C/blob/main/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

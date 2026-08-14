@@ -9,7 +9,7 @@ does and does not protect against, and how to report a vulnerability.
 
 Instead, use GitHub's private vulnerability reporting:
 **Security → Report a vulnerability** on the
-[repository](https://github.com/DBarr3/protocol-c/security/advisories/new),
+[repository](https://github.com/AetherAI3/PROTOCOL-C/security/advisories/new),
 or email the maintainer at the address listed on
 [aethersystems.net](https://aethersystems.net).
 
@@ -77,7 +77,7 @@ far toward that posture, so anyone evaluating the library for a
 compliance-relevant use case can see exactly what's been checked and
 what's still open.
 
-**2026-07-15 hardening pass** (tracked in [PR #8](https://github.com/DBarr3/protocol-c/pull/8)):
+**2026-07-15 hardening pass** (tracked in [PR #8](https://github.com/AetherAI3/PROTOCOL-C/pull/8)):
 a multi-round audit → adversarial review → fix cycle, followed by standing
 red-team/blue-team sparring rounds against the hardened surface. Every
 fix carries a dedicated regression test (suite: 137 tests). Summary —

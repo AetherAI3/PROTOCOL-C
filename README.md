@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-06b6d4)](LICENSE) [![Python](https://img.shields.io/badge/python-3.10%2B-14b8a6)](https://www.python.org) [![Dependencies](https://img.shields.io/badge/core%20deps-0-22c55e)](pyproject.toml) [![Built by Aether](https://img.shields.io/badge/built%20by-Aether-7c3aed)](https://aethersystems.net)
 
-**An open project from [Aether](https://aethersystems.net)** · Apache-2.0 · `pip install aether-protocol-c`
+**An open project from [Aether](https://aethersystems.net)** · Apache-2.0 · `pip install git+https://github.com/AetherAI3/PROTOCOL-C.git`
 
 </div>
 
@@ -87,8 +87,12 @@ The seal proves *who* and *what*; shredding the stamp proves it can't be re-used
 ## Quickstart
 
 ```bash
-pip install aether-protocol-c
+pip install git+https://github.com/AetherAI3/PROTOCOL-C.git
 ```
+
+> **Not on PyPI yet.** `pip install aether-protocol-c` will not resolve until the
+> first release is published. Install from git (above) — same package, same
+> `aether_protocol_c` import, same `aether-protocol-c` CLI entry point.
 
 ```python
 from aether_protocol_c import commit, verify, get_seed
@@ -117,7 +121,7 @@ That's the whole thing: one call to commit a decision, one call to prove it. No 
 ## Setup (30 seconds)
 
 ```bash
-pip install aether-protocol-c     # install
+pip install git+https://github.com/AetherAI3/PROTOCOL-C.git   # install
 aether-protocol-c info            # confirm Python, entropy source, key lifetime
 aether-protocol-c init            # scaffold aether.config.json + audit/ dir
 aether-protocol-c demo            # run a sample commit -> verify end to end
@@ -158,10 +162,21 @@ echo '{"commitment": {...}, "signature": {...}}' | aether-protocol-c verify
 ```python
 from aether_protocol_c import batch_commit
 
+account = {
+    "capital": 100_000, "equity": 100_000, "open_positions": [],
+    "risk_used": 0.0, "risk_limit": 1.0, "nonce": 1, "timestamp": 0,
+}
+
 results = batch_commit([
-    {"order_id": "b001", "trade_details": {...}, "account_state": {...}},
-    {"order_id": "b002", "trade_details": {...}, "account_state": {...}},
+    {"order_id": "b001",
+     "trade_details": {"symbol": "BTC", "qty": 1, "side": "long", "price": 50_000},
+     "account_state": account},
+    {"order_id": "b002",
+     "trade_details": {"symbol": "ETH", "qty": 4, "side": "short", "price": 3_000},
+     "account_state": {**account, "nonce": 2}},
 ], log_path="audit.jsonl")
+
+assert all(r["verified"] for r in results)
 
 # Each item gets its own independent seed and key — full forward secrecy across the batch.
 ```
@@ -171,22 +186,88 @@ results = batch_commit([
 For workflows that decide, act, then settle — each phase is its own independently-keyed commitment, so the chain is tamper-evident end to end:
 
 ```python
+import time
+
 from aether_protocol_c import get_seed
+from aether_protocol_c.audit import AuditLog
 from aether_protocol_c.commitment import QuantumDecisionCommitment
-from aether_protocol_c.execution import QuantumExecutionAttestation
-from aether_protocol_c.settlement import QuantumSettlementRecord
+from aether_protocol_c.crypto import QuantumEphemeralKey
+from aether_protocol_c.execution import ExecutionResult, QuantumExecutionAttestation
+from aether_protocol_c.settlement import (
+    QuantumSettlementRecord,
+    build_broker_attestation,
+)
+from aether_protocol_c.state import AccountSnapshot
 
-# Phase 1 — Commit the decision   (seed #1)
-c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(...)
+order_id = "ord_001"
+account = {
+    "capital": 100_000, "equity": 100_000, "open_positions": [],
+    "risk_used": 0.0, "risk_limit": 1.0, "nonce": 1,
+    "timestamp": int(time.time()),
+}
+log = AuditLog("audit.jsonl")
 
-# Phase 2 — Attest the execution  (seed #2, independent)
-att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(...)
+# ── Phase 1 — commit the decision (seed #1) ────────────────────────────────
+seed1 = get_seed()
+c_dict, c_sig, _ = QuantumDecisionCommitment.create_and_sign(
+    order_id=order_id,
+    trade_details={"symbol": "BTC", "qty": 1, "side": "long", "price": 50_000},
+    account_state=AccountSnapshot.from_dict(account),
+    quantum_seed=seed1.seed_int,
+    measurement_method=seed1.method,
+)
+log.append_commitment(c_dict, c_sig)
 
-# Phase 3 — Record settlement      (seed #3, independent)
-s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(...)
+# ── Phase 2 — attest the execution (seed #2, independent) ──────────────────
+seed2 = get_seed()
+att_dict, att_sig, _ = QuantumExecutionAttestation.create_and_sign(
+    commitment_sig=c_sig,
+    commitment_seed_hash=c_dict["quantum_seed_commitment"],
+    execution_result=ExecutionResult(
+        order_id=order_id, symbol="BTC", side="long",
+        filled_qty=1, fill_price=50_000,
+    ),
+    new_account_state=AccountSnapshot.from_dict({**account, "nonce": 2}),
+    quantum_seed=seed2.seed_int,
+    measurement_method=seed2.method,
+)
+log.append_execution(att_dict, att_sig)
+
+# ── Phase 3 — record settlement (seed #3, independent) ─────────────────────
+# The broker signs the attestation with its OWN key, so `broker_sig` is
+# authenticated rather than an arbitrary string the settlement signer typed in.
+# Register that pubkey in an AccountKeyRegistry under scope f"broker:{account_id}"
+# for AuditVerifier.verify_trade_flow to certify the flow.
+bseed = get_seed()
+broker_key = QuantumEphemeralKey(quantum_seed=bseed.seed_int, method=bseed.method)
+broker_signature = broker_key.sign(
+    build_broker_attestation(order_id, c_sig, att_sig, "broker_ack_001")
+)
+
+seed3 = get_seed()
+s_dict, s_sig, _ = QuantumSettlementRecord.create_and_sign(
+    order_id=order_id,
+    commitment_sig=c_sig,
+    commitment_seed_hash=c_dict["quantum_seed_commitment"],
+    commitment_window=c_dict["key_temporal_window"],
+    execution_sig=att_sig,
+    execution_seed_hash=att_dict["execution_quantum_seed_commitment"],
+    execution_window=att_dict["key_temporal_window"],
+    broker_sig="broker_ack_001",
+    broker_signature=broker_signature,
+    quantum_seed=seed3.seed_int,
+    measurement_method=seed3.method,
+)
+log.append_settlement(s_dict, s_sig)
 ```
 
-Each phase lands in the audit log under `DECISION_COMMITMENT`, `EXECUTION_ATTESTATION`, and `SETTLEMENT_FINALITY` respectively, with its own seed-commitment hash and temporal window.
+Each `create_and_sign` mints its own seed, key, and temporal window, then returns
+`(dict, signature_envelope, object)` — it does **not** touch the audit log. You append
+explicitly via `AuditLog.append_commitment` / `append_execution` / `append_settlement`,
+which land under the phase labels `DECISION_COMMITMENT`, `EXECUTION_ATTESTATION`, and
+`SETTLEMENT_FINALITY` respectively. Verify a completed chain with
+`QuantumSettlementVerifier.verify_chain(c_sig, att_sig, s_dict)` and
+`QuantumSettlementVerifier.verify_all_seeds_independent(s_dict)`.
 
 ## Security properties
 
@@ -231,7 +312,7 @@ If Protocol-C supports your work, please cite it. Built and maintained by **Aeth
   author       = {Barrante, Brandon},
   organization = {Aether},
   year         = {2026},
-  url          = {https://github.com/DBarr3/protocol-c},
+  url          = {https://github.com/AetherAI3/PROTOCOL-C},
   license      = {Apache-2.0}
 }
 ```
