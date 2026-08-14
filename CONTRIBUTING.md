@@ -21,7 +21,7 @@ fast to review.
 ## Development setup
 
 ```bash
-git clone https://github.com/DBarr3/protocol-c
+git clone https://github.com/AetherAI3/PROTOCOL-C
 cd AETHER-PROTOCOL-C
 python -m venv .venv && . .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
