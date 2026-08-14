@@ -4,7 +4,7 @@
 
 **Tamper-proof receipts for any decision your software makes.** Sign a piece of structured data with a key that is **born, used once, and destroyed in the same breath** — then prove, forever, that the record was never touched. Pure Python, zero mandatory dependencies, local-first. 
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-06b6d4)](LICENSE) [![Python](https://img.shields.io/badge/python-3.10%2B-14b8a6)](https://www.python.org) [![Dependencies](https://img.shields.io/badge/core%20deps-0-22c55e)](pyproject.toml) [![Built by Aether](https://img.shields.io/badge/built%20by-Aether-7c3aed)](https://aethersystems.net)
+[![CI](https://github.com/AetherAI3/PROTOCOL-C/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AetherAI3/PROTOCOL-C/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-06b6d4)](LICENSE) [![Python](https://img.shields.io/badge/python-3.10%2B-14b8a6)](https://www.python.org) [![Dependencies](https://img.shields.io/badge/core%20deps-0-22c55e)](pyproject.toml) [![Built by Aether](https://img.shields.io/badge/built%20by-Aether-7c3aed)](https://aethersystems.net)
 
 **An open project from [Aether](https://aethersystems.net)** · Apache-2.0 · `pip install git+https://github.com/AetherAI3/PROTOCOL-C.git`
 
