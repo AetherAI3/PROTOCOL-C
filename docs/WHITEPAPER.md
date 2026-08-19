@@ -103,7 +103,7 @@ No physical-unpredictability or quantum-hardware claims are made for Protocol-C.
 ## 8. Getting started
 
 ```bash
-pip install aether-protocol-c     # zero mandatory dependencies
+pip install git+https://github.com/AetherAI3/PROTOCOL-C.git   # not yet on PyPI; zero mandatory deps
 aether-protocol-c info            # version, Python, entropy source, key lifetime
 aether-protocol-c demo            # sample commit -> verify, end to end
 ```
